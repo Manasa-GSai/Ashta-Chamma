@@ -1,44 +1,70 @@
-# Ashta-Chamma 
+# Ashta Chamma 3D
 
-## Description: 
-An Indian version of the popular game Ludo. 
+A web-based 3D modernization of the traditional Indian board game **Ashta Chamma**
+(aka *Daayam*, *Tabla*) — built on **React Three Fiber + FastAPI + PostgreSQL**
+and deployed to **AWS**. See [Ashta Chamma on Wikipedia](https://wiki2.org/en/Ashta_Chamma_(board_game))
+for background on the game itself.
 
-See [Ashta-Chamma](https://wiki2.org/en/Ashta_Chamma_(board_game)) to know more
+This repository is a monorepo containing both the browser client and the
+server-authoritative game backend. The legacy pygame implementation
+(`game.py`, `player.py`, `path.py`, `helper.py`) is preserved at the repo
+root as a rule-fidelity reference until the new engine reaches feature parity.
 
-The game has been build by using **pygame** module in **python3** 🐍 
+## Monorepo layout
 
-![preview](/assets/screenshot/preview.gif)
+```
+.
+├── client/         # React + TypeScript + Vite SPA (React Three Fiber)
+│   ├── src/
+│   └── public/
+├── server/         # FastAPI + Pydantic v2 backend (Poetry / uv)
+│   ├── app/
+│   └── tests/
+├── infra/          # AWS CDK stacks (VPC, ECS, RDS, Redis, S3/CloudFront)
+├── docs/           # Architecture, API, runbooks, game-rule specs
+└── (legacy)        # game.py / player.py / path.py / helper.py (reference)
+```
 
-## Game Rules:
+## Quickstart
 
-1. When game starts all pawns are blocked at home, to release pawns player must roll 1 or 4 or 8.
-1. Every player has a path to reach destination . So when player gets a number, then he/she needs to choose one of their released pawns and move it that many squares along the path.
-1. Only one pawn can stand on a square except on a safe square which marked with star. So if player 1’s pawn stands on a square and player 2’s pawn is moving to the same square then player 2 pawn can kill Player 1’s pawn. Then player 1’s pawn will go back to the starting square and gets blocked again.
-1. When player rolls 4, 8 or kills opponent pawn he/she will get another chance to roll.
-1. Reaching the central square: A pawn needs to reach the central square exactly. For example, if a pawn is 3 squares away from the center and the player throws a 4, then that pawn cannot be moved.
+### Client (Vite + React + TypeScript)
 
-## Installation
-1. Install Python 3 from www.python.org
-1. Install required modules <br>
-<code> pip3 install -r requirements.txt </code>
-   
-## Usage:
-In a command prompt/terminal
+```bash
+cd client
+npm install
+npm run build      # produces dist/
+npm run lint
+npm run dev        # local dev server at http://localhost:5173
+```
 
-1. Use the 'cd' command to go to the downloaded/cloned directory
-1. Run the following command <br>
-<code>python3 game.py </code>
-  
-## Screenshot:
-![preview](/assets/screenshot/preview.png)
+TypeScript is configured with `"strict": true` and `"noImplicitAny": true`.
+Linting uses **ESLint 9 (flat config)** + `typescript-eslint`, with Prettier
+for formatting.
 
-## Contribution :
-Interested people can contribute to develop the game 🙌
+### Server (FastAPI + Poetry)
 
-if you dont know what to do check project board 🎯
+```bash
+cd server
+poetry install     # or: uv sync
+ruff check .
+pytest
+```
 
-You may contibute to this project by developing additional features.
+Python **3.12+** is required. Core dependencies pinned in `server/pyproject.toml`:
+FastAPI, Uvicorn, Pydantic v2, SQLAlchemy 2.0 (async).
 
-Pull requests are welcome. For major changes, please open an issue first to discuss what you would like to change.
-		 
-### Made with lots of ⏱️, 📚 and ☕ by [Jaya Shankar](https://github.com/jaya-shankar) & [InputBlackBoxOutput](https://github.com/InputBlackBoxOutput)
+## What this work order delivers
+
+This is **WO-001 — Initialize Monorepo with Build Tooling** (REQ-016, AWS
+Infrastructure Deployment). It establishes the directory layout, build
+toolchain, and lint/format/type-check baseline for both client and server.
+Application code, CDK stacks, and CI/CD are intentionally out of scope and
+are tracked under WO-002 (CDK), WO-003 (GitHub Actions), and WO-004 (FastAPI
+skeleton).
+
+## License
+
+See `LICENSE`. Originally authored by
+[Jaya Shankar](https://github.com/jaya-shankar) and
+[InputBlackBoxOutput](https://github.com/InputBlackBoxOutput); modernization
+in progress.
