@@ -1,1 +1,35 @@
-/__pycache__ 
+# Python / legacy pygame app
+__pycache__/
+*.py[cod]
+*$py.class
+.Python
+.venv
+venv/
+.mypy_cache
+.ruff_cache
+.pytest_cache
+htmlcov
+.coverage
+*.egg-info
+
+# Node / client (also redundantly listed in client/.gitignore)
+node_modules/
+dist/
+dist-ssr/
+.vite/
+*.tsbuildinfo
+
+# Editor / OS
+.DS_Store
+*.log
+.idea/
+.vscode/
+
+# Env files
+.env
+.env.local
+
+# Forge — managed local artifacts
+.forge-commit-ready
+.forge/project-id
+.claude/hooks/
