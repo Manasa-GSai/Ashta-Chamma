@@ -1,0 +1,23 @@
+{
+  "name": "ashta-chamma-infra",
+  "version": "0.1.0",
+  "description": "AWS CDK infrastructure for Ashta Chamma 3D",
+  "scripts": {
+    "build": "tsc",
+    "watch": "tsc -w",
+    "test": "jest",
+    "cdk": "cdk"
+  },
+  "devDependencies": {
+    "@types/jest": "^29.5.12",
+    "@types/node": "^20.14.11",
+    "aws-cdk": "^2.154.1",
+    "jest": "^29.7.0",
+    "ts-jest": "^29.2.3",
+    "typescript": "^5.5.4"
+  },
+  "dependencies": {
+    "aws-cdk-lib": "^2.154.1",
+    "constructs": "^10.3.0"
+  }
+}
