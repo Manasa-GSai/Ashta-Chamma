@@ -1,134 +1,73 @@
-/**
- * Zustand store for Ashta Chamma game state.
- *
- * Holds the authoritative client-side mirror of the server game state.
- * State is updated exclusively by applying server-sent WebSocket messages
- * so that the client never diverges from the server.
- *
- * The `isSpectator` flag drives conditional UI rendering: the Roll button
- * and pawn-selection are hidden for spectators.
- */
-
-// NOTE: zustand is listed as a runtime dependency in the full project.
-// The type imports below will resolve once `npm install` is run.
 import { create } from 'zustand';
 
-// ---------------------------------------------------------------------------
-// Types
-// ---------------------------------------------------------------------------
+/**
+ * Represents the WebSocket connection lifecycle states exposed to the UI.
+ * 'reconnecting' is distinct from 'connecting' so the UI can show retry context.
+ */
+export type ConnectionState = 'connecting' | 'connected' | 'disconnected' | 'reconnecting';
 
-export type PlayerRole = 'player' | 'spectator';
-
-export interface RoomPlayer {
-  user_id: string;
-  display_name: string;
-  role: PlayerRole;
-  player_index: number | null;
-  color: string | null;
+export interface RollResult {
+  value: number;
+  cowries: boolean[];
 }
 
-export type RoomStatus = 'waiting' | 'in_progress' | 'completed' | 'abandoned';
+// Game state received from server — flexible shape for server-authoritative model.
+export type GameState = Record<string, unknown>;
 
-export interface RoomState {
-  code: string;
-  host_user_id: string;
-  status: RoomStatus;
-  max_players: number;
-  players: RoomPlayer[];
-}
+export interface GameStoreState {
+  // --- Connection slice ---
+  connectionState: ConnectionState;
+  reconnectAttempts: number;
+  connectionError: string | null;
 
-export interface GamePhase {
-  currentTurn: string | null;
-  rollResult: number | null;
-  moveOptions: Array<{ pawn_id: number; target_pos: number }>;
-}
+  // --- Game state slice ---
+  lastRollResult: RollResult | null;
+  gameState: GameState | null;
 
-// Shape of the server's `state_update` WebSocket message
-export interface StateUpdateMessage {
-  type: 'state_update';
-  state: RoomState;
-  is_spectator?: boolean;
-}
-
-// ---------------------------------------------------------------------------
-// Store interface
-// ---------------------------------------------------------------------------
-
-interface GameStore {
-  // Room identity
-  room: RoomState | null;
-  /** True when the current user joined as a spectator. */
-  isSpectator: boolean;
-  currentUserId: string | null;
-
-  // Live game phase
-  phase: GamePhase;
-
-  // Actions
-  setCurrentUserId: (userId: string) => void;
-  setIsSpectator: (value: boolean) => void;
-  setRoom: (room: RoomState) => void;
-  setRollResult: (value: number | null) => void;
-  setCurrentTurn: (userId: string | null) => void;
-  setMoveOptions: (options: Array<{ pawn_id: number; target_pos: number }>) => void;
-
+  // --- Actions ---
+  setConnectionState: (state: ConnectionState) => void;
+  setReconnectAttempts: (attempts: number) => void;
+  setConnectionError: (error: string | null) => void;
+  updateRoll: (result: RollResult) => void;
+  updateGameState: (state: GameState) => void;
   /**
-   * Apply a `state_update` message from the server.
-   * Updates room snapshot and spectator flag atomically.
+   * Sets a user-visible error message (e.g. from server 'error' messages or
+   * failed reconnection). Alias for setConnectionError — kept for semantic clarity.
    */
-  applyStateUpdate: (message: StateUpdateMessage) => void;
-
-  /** Reset store to initial values (e.g. after leaving a room). */
-  reset: () => void;
+  setError: (error: string) => void;
+  /**
+   * Triggers a manual reconnection attempt via the registered callback from
+   * WebSocketManager. Called by the UI "Reconnect" button after max retries.
+   */
+  triggerManualReconnect: () => void;
 }
 
-// ---------------------------------------------------------------------------
-// Initial values
-// ---------------------------------------------------------------------------
+// Callback registered by WebSocketManager so the store action can reach it
+// without creating a circular import. The manager calls setReconnectCallback
+// on instantiation.
+let _reconnectCallback: (() => void) | null = null;
 
-const initialPhase: GamePhase = {
-  currentTurn: null,
-  rollResult: null,
-  moveOptions: [],
+export const setReconnectCallback = (cb: (() => void) | null): void => {
+  _reconnectCallback = cb;
 };
 
-const initialState = {
-  room: null,
-  isSpectator: false,
-  currentUserId: null,
-  phase: initialPhase,
-};
+export const useGameStore = create<GameStoreState>((set) => ({
+  connectionState: 'disconnected',
+  reconnectAttempts: 0,
+  connectionError: null,
+  lastRollResult: null,
+  gameState: null,
 
-// ---------------------------------------------------------------------------
-// Store
-// ---------------------------------------------------------------------------
+  setConnectionState: (state) => set({ connectionState: state }),
+  setReconnectAttempts: (attempts) => set({ reconnectAttempts: attempts }),
+  setConnectionError: (error) => set({ connectionError: error }),
+  updateRoll: (result) => set({ lastRollResult: result }),
+  updateGameState: (state) => set({ gameState: state }),
+  setError: (error) => set({ connectionError: error }),
 
-export const useGameStore = create<GameStore>((set) => ({
-  ...initialState,
-
-  setCurrentUserId: (currentUserId: string) => set({ currentUserId }),
-
-  setIsSpectator: (isSpectator: boolean) => set({ isSpectator }),
-
-  setRoom: (room: RoomState) => set({ room }),
-
-  setRollResult: (rollResult: number | null) =>
-    set((prev) => ({ phase: { ...prev.phase, rollResult } })),
-
-  setCurrentTurn: (currentTurn: string | null) =>
-    set((prev) => ({ phase: { ...prev.phase, currentTurn } })),
-
-  setMoveOptions: (moveOptions: Array<{ pawn_id: number; target_pos: number }>) =>
-    set((prev) => ({ phase: { ...prev.phase, moveOptions } })),
-
-  applyStateUpdate: (message: StateUpdateMessage) =>
-    set((prev) => ({
-      room: message.state,
-      // Only update isSpectator when the server explicitly sends the flag;
-      // subsequent state_update messages after the initial one omit it.
-      isSpectator:
-        message.is_spectator !== undefined ? message.is_spectator : prev.isSpectator,
-    })),
-
-  reset: () => set({ ...initialState, phase: { ...initialPhase } }),
+  triggerManualReconnect: () => {
+    if (_reconnectCallback) {
+      _reconnectCallback();
+    }
+  },
 }));
