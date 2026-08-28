@@ -1,143 +1,77 @@
 import { create } from 'zustand';
-import type { PlayerColor } from '../utils/gridToWorld';
 
-export interface GridPosition {
-  row: number;
-  col: number;
-}
+export type GamePhase =
+  | 'WAITING'
+  | 'ROLLING'
+  | 'SELECTING'
+  | 'MOVING'
+  | 'CAPTURING'
+  | 'GAME_OVER';
 
 /**
- * Represents the full state of a single pawn.
- * pathIndex is -1 when the pawn has not yet entered the board.
- * gridPosition is null when the pawn is at home or finished.
+ * Represents a single legal move option returned by the server's move_options
+ * message. Holds the pawn that may move and the board index it will land on.
  */
-export interface PawnState {
-  /** Unique identifier, e.g. "red_0", "blue_3" */
-  id: string;
-  color: PlayerColor;
-  /** 0-3, the pawn's index within its player's set of 4 */
-  pawnIndex: number;
-  /**
-   * Position in the player's path array.
-   * -1 = at home base (not yet entered board).
-   * 0-48 = on the board path.
-   * 49 = finished (center square).
-   */
-  pathIndex: number;
-  /** Current board grid position; null if at home */
-  gridPosition: GridPosition | null;
-  /** True when the pawn has not yet entered the board */
-  isHome: boolean;
-  /** True when the pawn has reached the center (won) */
-  isFinished: boolean;
-  /** True while the pawn is currently animating */
-  isAnimating: boolean;
-  /**
-   * True when the pawn is returning to home after being captured.
-   * Triggers a parabolic arc animation instead of a path-following animation.
-   */
-  captureReturn: boolean;
-  /**
-   * Intermediate path squares (excluding destination) for movement animation.
-   * Empty for single-square moves or capture returns.
-   */
-  waypoints: GridPosition[];
+export interface MoveOption {
+  pawn_id: number;
+  target_pos: number;
 }
 
-interface GameStoreState {
-  pawns: PawnState[];
-  /** Replaces the entire pawn array (used for server state sync) */
-  setPawns: (pawns: PawnState[]) => void;
-  /** Marks a pawn's animation state (called by Pawn3D on completion) */
-  setPawnAnimating: (id: string, isAnimating: boolean) => void;
+export interface GameStore {
+  gamePhase: GamePhase;
+  currentPlayerId: string | null;
+  localPlayerId: string | null;
+  /** IDs of pawns that the current player may select this turn. */
+  legalMoveIds: number[];
+  /** Full move options including destination positions (for destination highlights). */
+  moveOptions: MoveOption[];
+  selectedPawnId: number | null;
+
+  // --- Actions ---
+  setGamePhase: (phase: GamePhase) => void;
   /**
-   * Moves a pawn along waypoints to destination.
-   * Sets isAnimating: true so Pawn3D triggers movement animation.
+   * Ingest move_options from the server, populate legalMoveIds, and
+   * transition to the SELECTING phase so Pawn3D components become clickable.
    */
-  movePawn: (id: string, waypoints: GridPosition[], destination: GridPosition, newPathIndex: number) => void;
-  /** Sends a captured pawn back to home base with arc animation */
-  capturePawn: (id: string) => void;
-  /** Marks a pawn as having finished (reached center square) */
-  finishPawn: (id: string) => void;
+  setMoveOptions: (options: MoveOption[]) => void;
+  setSelectedPawnId: (pawnId: number | null) => void;
+  setCurrentPlayer: (playerId: string | null) => void;
+  setLocalPlayer: (playerId: string | null) => void;
+  /**
+   * Clear all selection state once the player has chosen a pawn.
+   * Called immediately after dispatching select_pawn so highlights disappear
+   * and no further clicks are processed.
+   */
+  clearSelection: () => void;
 }
 
-/** All 16 pawns start at their home base positions */
-const buildInitialPawns = (): PawnState[] =>
-  (['red', 'blue', 'green', 'yellow'] as PlayerColor[]).flatMap((color) =>
-    ([0, 1, 2, 3] as const).map<PawnState>((pawnIndex) => ({
-      id: `${color}_${pawnIndex}`,
-      color,
-      pawnIndex,
-      pathIndex: -1,
-      gridPosition: null,
-      isHome: true,
-      isFinished: false,
-      isAnimating: false,
-      captureReturn: false,
-      waypoints: [],
-    })),
-  );
+export const useGameStore = create<GameStore>((set) => ({
+  gamePhase: 'WAITING',
+  currentPlayerId: null,
+  localPlayerId: null,
+  legalMoveIds: [],
+  moveOptions: [],
+  selectedPawnId: null,
 
-export const useGameStore = create<GameStoreState>((set) => ({
-  pawns: buildInitialPawns(),
+  setGamePhase: (phase) => set({ gamePhase: phase }),
 
-  setPawns: (pawns) => set({ pawns }),
+  setMoveOptions: (options) =>
+    set({
+      moveOptions: options,
+      legalMoveIds: options.map((o) => o.pawn_id),
+      gamePhase: 'SELECTING',
+    }),
 
-  setPawnAnimating: (id, isAnimating) =>
-    set((state) => ({
-      pawns: state.pawns.map((p) =>
-        p.id === id
-          ? { ...p, isAnimating, captureReturn: isAnimating ? p.captureReturn : false }
-          : p,
-      ),
-    })),
+  setSelectedPawnId: (pawnId) => set({ selectedPawnId: pawnId }),
 
-  movePawn: (id, waypoints, destination, newPathIndex) =>
-    set((state) => ({
-      pawns: state.pawns.map((p) =>
-        p.id === id
-          ? {
-              ...p,
-              isHome: false,
-              isAnimating: true,
-              captureReturn: false,
-              waypoints,
-              gridPosition: destination,
-              pathIndex: newPathIndex,
-            }
-          : p,
-      ),
-    })),
+  setCurrentPlayer: (playerId) => set({ currentPlayerId: playerId }),
 
-  capturePawn: (id) =>
-    set((state) => ({
-      pawns: state.pawns.map((p) =>
-        p.id === id
-          ? {
-              ...p,
-              pathIndex: -1,
-              gridPosition: null,
-              isHome: true,
-              isAnimating: true,
-              captureReturn: true,
-              waypoints: [],
-            }
-          : p,
-      ),
-    })),
+  setLocalPlayer: (playerId) => set({ localPlayerId: playerId }),
 
-  finishPawn: (id) =>
-    set((state) => ({
-      pawns: state.pawns.map((p) =>
-        p.id === id
-          ? {
-              ...p,
-              isFinished: true,
-              isAnimating: false,
-              captureReturn: false,
-              waypoints: [],
-            }
-          : p,
-      ),
-    })),
+  clearSelection: () =>
+    set({
+      selectedPawnId: null,
+      legalMoveIds: [],
+      moveOptions: [],
+    }),
 }));

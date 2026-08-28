@@ -1,171 +1,96 @@
-import { useRef, useEffect, memo } from 'react';
-import { useFrame } from '@react-three/fiber';
-import * as THREE from 'three';
-import type { PawnState } from '../../store/gameStore';
-import {
-  gridToWorld,
-  homePosition,
-  centerPosition,
-  generateCaptureArc,
-} from '../../utils/gridToWorld';
-import { usePawnAnimation } from '../../hooks/usePawnAnimation';
+import { useRef, useState, useCallback } from 'react';
+import { type Mesh, Color } from 'three';
+import { type ThreeEvent } from '@react-three/fiber';
 import { useGameStore } from '../../store/gameStore';
+import { webSocketManager } from '../../websocket/WebSocketManager';
 
-/**
- * WCAG 2.1 AA compliant pawn colors.
- * These saturated colors achieve ≥4.5:1 contrast ratio against the expected
- * dark-wood board surface (#3E2723 ≈ dark brown). Verified via APCA.
- */
-const PAWN_HEX_COLORS: Record<string, string> = {
-  red: '#CC0000',
-  blue: '#1A56DB',
-  green: '#057A55',
-  // Dark amber replaces pure yellow, which fails 4.5:1 against light surfaces
-  yellow: '#B45309',
-};
-
-/** Pawn geometry dimensions (in world units, CELL_SIZE = 1.0) */
-const CONE_RADIUS = 0.2;
-const CONE_HEIGHT = 0.4;
-const CONE_SEGMENTS = 8;
-const HEAD_RADIUS = 0.15;
-const HEAD_SEGMENTS = 8;
-
-/** Y offset from group origin to cone center */
-const CONE_Y = CONE_HEIGHT / 2;
-/** Y offset from group origin to sphere center (sits on top of cone) */
-const HEAD_Y = CONE_HEIGHT + HEAD_RADIUS * 0.9;
-
-/** Celebration pulse: angular frequency (radians / second) */
-const CELEBRATION_FREQ = 4.0;
-const CELEBRATION_AMPLITUDE = 0.18;
-
-/**
- * Computes the target world position for a pawn based on its current state.
- */
-function computeTargetPosition(pawn: PawnState): THREE.Vector3 {
-  if (pawn.isFinished) {
-    return centerPosition(pawn.color);
-  }
-  if (pawn.isHome || pawn.gridPosition === null) {
-    return homePosition(pawn.color, pawn.pawnIndex);
-  }
-  return gridToWorld(pawn.gridPosition.row, pawn.gridPosition.col);
+export interface Pawn3DProps {
+  pawnId: number;
+  position: [number, number, number];
+  /** CSS/hex color string for the pawn body — one per player. */
+  color: string;
 }
 
-/**
- * Builds the waypoint array for movement animation.
- * For standard moves: intermediate path squares + final destination.
- * For capture returns: a parabolic arc from the last known position to home.
- */
-function buildAnimationWaypoints(
-  pawn: PawnState,
-  targetPosition: THREE.Vector3,
-  currentPosition: THREE.Vector3,
-): THREE.Vector3[] {
-  if (pawn.captureReturn) {
-    // Parabolic arc from wherever the pawn was back to home
-    return generateCaptureArc(currentPosition.clone(), targetPosition);
-  }
-
-  const pathWaypoints = pawn.waypoints.map((wp) => gridToWorld(wp.row, wp.col));
-  return [...pathWaypoints, targetPosition.clone()];
-}
-
-interface Pawn3DProps {
-  pawn: PawnState;
-}
+/** Warm amber glow applied to selectable pawns. */
+const HIGHLIGHT_COLOR = new Color(0xffaa00);
+const DEFAULT_COLOR = new Color(0x000000);
+const HIGHLIGHT_INTENSITY = 1.5;
+const HOVER_INTENSITY = 2.1;
+const DEFAULT_INTENSITY = 0;
 
 /**
- * Renders a single 3D pawn (cone body + sphere head) and drives its animation.
+ * 3D pawn mesh rendered with React Three Fiber.
  *
- * Animation is handled entirely via mutable refs and useFrame so that per-frame
- * position updates bypass React's reconciler — keeping the scene smooth at 60 FPS.
- *
- * Wrapped in React.memo so it only re-renders when the pawn state object changes.
+ * Selection behaviour:
+ *  - When the server sends move_options, the Zustand store transitions to
+ *    SELECTING and populates legalMoveIds.  Any Pawn3D whose pawnId is in
+ *    legalMoveIds becomes "selectable" and receives an emissive glow.
+ *  - Clicking a selectable pawn dispatches `{type: "select_pawn", pawn_id}`
+ *    via WebSocket, clears selection state, and transitions to MOVING.
+ *  - Non-selectable pawns absorb no pointer events (stopPropagation guard).
  */
-export const Pawn3D = memo(({ pawn }: Pawn3DProps) => {
-  const groupRef = useRef<THREE.Group>(null);
-  const celebrationTimeRef = useRef(0);
-  const setPawnAnimating = useGameStore((s) => s.setPawnAnimating);
+export const Pawn3D = ({ pawnId, position, color }: Pawn3DProps): JSX.Element => {
+  const meshRef = useRef<Mesh>(null);
+  const [isHovered, setIsHovered] = useState(false);
 
-  const targetPosition = computeTargetPosition(pawn);
+  const legalMoveIds = useGameStore((state) => state.legalMoveIds);
+  const gamePhase = useGameStore((state) => state.gamePhase);
+  const clearSelection = useGameStore((state) => state.clearSelection);
+  const setGamePhase = useGameStore((state) => state.setGamePhase);
 
-  const { positionRef, animateTo, snapTo } = usePawnAnimation(targetPosition, {
-    onComplete: () => setPawnAnimating(pawn.id, false),
-  });
+  /** True only when this specific pawn is in the current legal move list. */
+  const isSelectable = legalMoveIds.includes(pawnId) && gamePhase === 'SELECTING';
 
-  // Stable key to detect when a new animation batch is requested
-  const animationKeyRef = useRef('');
-  const animationKey = `${pawn.isAnimating}|${pawn.waypoints.map((w) => `${w.row},${w.col}`).join('|')}|${pawn.captureReturn}`;
+  const handlePointerDown = useCallback(
+    (event: ThreeEvent<PointerEvent>) => {
+      if (!isSelectable) return;
+      // Prevent the board / scene from also receiving this click.
+      event.stopPropagation();
+      webSocketManager.send({ type: 'select_pawn', pawn_id: pawnId });
+      // Clear highlights immediately so the UI responds before the server reply.
+      clearSelection();
+      setGamePhase('MOVING');
+    },
+    [isSelectable, pawnId, clearSelection, setGamePhase],
+  );
 
-  useEffect(() => {
-    if (pawn.isAnimating && animationKey !== animationKeyRef.current) {
-      animationKeyRef.current = animationKey;
-      const waypts = buildAnimationWaypoints(pawn, targetPosition, positionRef.current);
-      if (waypts.length > 0) {
-        animateTo(waypts);
-      }
-    } else if (!pawn.isAnimating) {
-      // Reset key so a future animation with identical waypoints can still trigger.
-      // This handles the case where a pawn moves to the same square it moved to before.
-      animationKeyRef.current = '';
-      // Snap immediately to target when animation is not active
-      // (covers initial placement and external state resets)
-      snapTo(targetPosition);
-    }
-    // positionRef, animateTo, snapTo are stable refs — intentionally omitted
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [pawn.isAnimating, animationKey]);
+  const handlePointerOver = useCallback(
+    (event: ThreeEvent<PointerEvent>) => {
+      if (!isSelectable) return;
+      event.stopPropagation();
+      setIsHovered(true);
+      document.body.style.cursor = 'pointer';
+    },
+    [isSelectable],
+  );
 
-  // Per-frame: apply animated position to group and drive celebration effect
-  useFrame((_state, delta) => {
-    const group = groupRef.current;
-    if (!group) return;
+  const handlePointerOut = useCallback(() => {
+    setIsHovered(false);
+    document.body.style.cursor = 'default';
+  }, []);
 
-    const pos = positionRef.current;
-    group.position.set(pos.x, pos.y, pos.z);
-
-    if (pawn.isFinished) {
-      celebrationTimeRef.current += delta;
-      const s = 1 + CELEBRATION_AMPLITUDE * Math.sin(celebrationTimeRef.current * CELEBRATION_FREQ);
-      group.scale.setScalar(s);
-    } else {
-      group.scale.setScalar(1);
-    }
-  });
-
-  const hexColor = PAWN_HEX_COLORS[pawn.color] ?? '#888888';
-  // Finished pawns glow with their own emissive color for a celebration effect
-  const emissiveHex = pawn.isFinished ? hexColor : '#000000';
-  const emissiveIntensity = pawn.isFinished ? 0.45 : 0;
+  const emissiveColor = isSelectable ? HIGHLIGHT_COLOR : DEFAULT_COLOR;
+  const emissiveIntensity = isSelectable
+    ? isHovered
+      ? HOVER_INTENSITY
+      : HIGHLIGHT_INTENSITY
+    : DEFAULT_INTENSITY;
 
   return (
-    <group ref={groupRef}>
-      {/* Pawn body: tapered cone */}
-      <mesh position={[0, CONE_Y, 0]} castShadow receiveShadow>
-        <coneGeometry args={[CONE_RADIUS, CONE_HEIGHT, CONE_SEGMENTS]} />
-        <meshStandardMaterial
-          color={hexColor}
-          roughness={0.35}
-          metalness={0.25}
-          emissive={emissiveHex}
-          emissiveIntensity={emissiveIntensity}
-        />
-      </mesh>
-      {/* Pawn head: sphere sitting atop the cone */}
-      <mesh position={[0, HEAD_Y, 0]} castShadow receiveShadow>
-        <sphereGeometry args={[HEAD_RADIUS, HEAD_SEGMENTS, HEAD_SEGMENTS]} />
-        <meshStandardMaterial
-          color={hexColor}
-          roughness={0.35}
-          metalness={0.25}
-          emissive={emissiveHex}
-          emissiveIntensity={emissiveIntensity}
-        />
-      </mesh>
-    </group>
+    <mesh
+      ref={meshRef}
+      position={position}
+      onPointerDown={handlePointerDown}
+      onPointerOver={handlePointerOver}
+      onPointerOut={handlePointerOut}
+    >
+      {/* Slightly wider base for stability, 16-sided cylinder for roundness */}
+      <cylinderGeometry args={[0.3, 0.35, 0.6, 16]} />
+      <meshStandardMaterial
+        color={color}
+        emissive={emissiveColor}
+        emissiveIntensity={emissiveIntensity}
+      />
+    </mesh>
   );
-});
-
-Pawn3D.displayName = 'Pawn3D';
+};
