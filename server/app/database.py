@@ -1,61 +1,30 @@
-"""Async SQLAlchemy engine and session factory.
+"""Database engine and session factory for async SQLAlchemy access.
 
-Environment variables expected at runtime:
-  DATABASE_URL — PostgreSQL DSN, e.g.
-      ``postgresql+asyncpg://user:pass@host:5432/dbname``
-
-The engine is created lazily via ``get_engine()`` so tests can substitute a
-test database URL without monkey-patching at import time.
+The session is provided to route handlers via the ``get_db`` FastAPI
+dependency.  Each request receives its own ``AsyncSession`` that is closed
+after the response is sent.
 """
 
 import os
+from collections.abc import AsyncGenerator
 
-from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
-_engine: AsyncEngine | None = None
-_session_factory: async_sessionmaker[AsyncSession] | None = None
+_DATABASE_URL: str = os.environ.get(
+    "DATABASE_URL",
+    "postgresql+asyncpg://postgres:postgres@localhost:5432/ashta_chamma",
+)
 
+engine = create_async_engine(_DATABASE_URL, echo=False, future=True)
 
-def get_engine() -> AsyncEngine:
-    """Return the module-level async engine, creating it once on first call."""
-    global _engine
-    if _engine is None:
-        database_url = os.environ.get("DATABASE_URL")
-        if not database_url:
-            raise RuntimeError(
-                "DATABASE_URL environment variable is not set. "
-                "Expected format: postgresql+asyncpg://user:pass@host:5432/dbname"
-            )
-        _engine = create_async_engine(
-            database_url,
-            echo=False,
-            pool_pre_ping=True,
-        )
-    return _engine
+_async_session_factory: async_sessionmaker[AsyncSession] = async_sessionmaker(
+    engine,
+    expire_on_commit=False,
+    class_=AsyncSession,
+)
 
 
-def get_session_factory() -> async_sessionmaker[AsyncSession]:
-    """Return the module-level session factory, creating it once on first call."""
-    global _session_factory
-    if _session_factory is None:
-        _session_factory = async_sessionmaker(
-            bind=get_engine(),
-            expire_on_commit=False,
-            autoflush=False,
-            autocommit=False,
-        )
-    return _session_factory
-
-
-async def get_db_session() -> AsyncSession:  # type: ignore[return]
-    """Async generator that yields a single ``AsyncSession`` per request.
-
-    Usage in a route::
-
-        @router.get("/example")
-        async def example(db: AsyncSession = Depends(get_db_session)):
-            ...
-    """
-    factory = get_session_factory()
-    async with factory() as session:
+async def get_db() -> AsyncGenerator[AsyncSession, None]:
+    """FastAPI dependency that yields a database session per request."""
+    async with _async_session_factory() as session:
         yield session

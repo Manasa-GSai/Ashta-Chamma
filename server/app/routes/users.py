@@ -1,84 +1,54 @@
-"""User profile endpoints.
+"""User-related REST endpoints.
 
-Provides:
-- ``GET  /api/users/me`` — return the authenticated user's profile.
-- ``PUT  /api/users/me`` — update display name and/or locale, audit-logged.
+DELETE /api/users/me  —  GDPR right-to-erasure
+    Anonymises all PII for the authenticated user, de-links game scores,
+    and records a permanent audit log entry.  Returns 204 on success.
 
-Both endpoints require a valid Clerk JWT (enforced by
-:func:`~app.deps.get_current_user`).  The PUT endpoint validates the
-request body with Pydantic strict types before touching the database.
+The operation is atomic: the caller's ``AsyncSession`` wraps all mutations
+inside a single ``BEGIN`` / ``COMMIT`` block.  A failure in any step rolls
+back the entire transaction, leaving the database unchanged.
 """
 
-from typing import Annotated, Any
-
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.db import get_db
-from app.deps import get_current_user
-from app.models.audit_log import AuditLog
-from app.models.user import User
-from app.schemas.user import UserResponse, UserUpdateRequest
+from app.database import get_db
+from app.dependencies import get_current_clerk_id
+from app.services.user_service import UserNotFoundError, UserService
 
-router = APIRouter(prefix="/users", tags=["users"])
+router = APIRouter(prefix="/api/users", tags=["users"])
 
 
-@router.get("/me", response_model=UserResponse, summary="Get current user profile")
-async def get_me(
-    current_user: Annotated[User, Depends(get_current_user)],
-) -> User:
-    """Return the profile of the currently authenticated user.
+@router.delete(
+    "/me",
+    status_code=status.HTTP_204_NO_CONTENT,
+    summary="GDPR right-to-erasure — delete the authenticated user's personal data",
+    responses={
+        204: {"description": "User PII successfully erased"},
+        401: {"description": "Missing or invalid authentication token"},
+        404: {"description": "Authenticated user not found (already erased or never created)"},
+    },
+)
+async def delete_current_user(
+    clerk_user_id: str = Depends(get_current_clerk_id),
+    db: AsyncSession = Depends(get_db),
+) -> None:
+    """Erase the authenticated user's personal data.
 
-    The ``get_current_user`` dependency handles JWT verification and DB
-    lookup, so this handler is intentionally thin.
+    All mutations (user record anonymisation, game_scores de-linking, audit
+    log creation) are wrapped in a single database transaction.  Either all
+    PII is erased or none is — partial erasure is not possible.
+
+    After successful erasure, subsequent requests with the same JWT will
+    return 404 because the stored ``clerk_id`` has been replaced with a hash
+    that no longer matches the JWT ``sub`` claim.
     """
-    return current_user
-
-
-@router.put("/me", response_model=UserResponse, summary="Update current user profile")
-async def update_me(
-    body: UserUpdateRequest,
-    current_user: Annotated[User, Depends(get_current_user)],
-    db: Annotated[AsyncSession, Depends(get_db)],
-) -> User:
-    """Update the authenticated user's display name and/or locale.
-
-    Tracks only changed fields in the audit log metadata so the log entry
-    is meaningful even when only one of the two fields is modified.  The
-    audit entry is written in the same transaction as the user update to
-    ensure consistency.
-    """
-    changed_fields: dict[str, Any] = {}
-
-    if body.display_name != current_user.display_name:
-        changed_fields["display_name"] = {
-            "from": current_user.display_name,
-            "to": body.display_name,
-        }
-        current_user.display_name = body.display_name
-
-    if body.locale != current_user.locale:
-        changed_fields["locale"] = {
-            "from": current_user.locale,
-            "to": body.locale,
-        }
-        current_user.locale = body.locale
-
-    db.add(current_user)
-
-    # Audit log is mandatory for every profile mutation (SOC 2 requirement).
-    audit_entry = AuditLog(
-        actor_id=current_user.id,
-        action="user.profile_updated",
-        entity_type="user",
-        entity_id=str(current_user.id),
-        metadata={"changed_fields": changed_fields},
-    )
-    db.add(audit_entry)
-
-    # Flush within the transaction so the updated values are reflected on
-    # the object without waiting for the session commit.
-    await db.flush()
-    await db.refresh(current_user)
-
-    return current_user
+    service = UserService(db)
+    try:
+        async with db.begin():
+            await service.erase_user(clerk_user_id)
+    except UserNotFoundError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=str(exc),
+        ) from exc

@@ -1,7 +1,7 @@
-"""Shared SQLAlchemy declarative base for all ORM models."""
+"""Shared declarative base for all SQLAlchemy ORM models."""
 
 from sqlalchemy.orm import DeclarativeBase
 
 
 class Base(DeclarativeBase):
-    """All ORM models inherit from this base class."""
+    """Common base class inherited by every ORM model in this package."""
