@@ -33,3 +33,4 @@ dist-ssr/
 .forge-commit-ready
 .forge/project-id
 .claude/hooks/
+CLAUDE.md
