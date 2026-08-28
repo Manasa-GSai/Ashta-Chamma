@@ -1,0 +1,163 @@
+# WebSocket Load Test — manual trigger only (pre-release validation)
+#
+# Runs the Locust load test against the staging environment.
+# NEVER runs against production.
+#
+# Trigger: workflow_dispatch (manual via GitHub UI or `gh workflow run`)
+# Artifacts: HTML report + CSV metrics saved for 30 days
+#
+# Required repository secrets (staging environment):
+#   STAGING_URL        — Base URL of the staging server, e.g. https://staging.example.com
+#   TEST_JWT_SECRET    — HS256 secret shared with the staging server for test auth bypass
+
+name: WebSocket Load Test
+
+on:
+  workflow_dispatch:
+    inputs:
+      users:
+        description: "Number of concurrent users (default: 500)"
+        required: false
+        default: "500"
+      spawn_rate:
+        description: "Users spawned per second (default: 10)"
+        required: false
+        default: "10"
+      run_time:
+        description: "Total test duration, e.g. 7m (default: 7m)"
+        required: false
+        default: "7m"
+      rooms_count:
+        description: "Number of rooms to pre-create (default: 125)"
+        required: false
+        default: "125"
+
+# Only one load test should run at a time to avoid skewing metrics.
+concurrency:
+  group: load-test-staging
+  cancel-in-progress: false
+
+jobs:
+  load-test:
+    name: "Locust WebSocket Load Test"
+    runs-on: ubuntu-latest
+
+    # Protect staging credentials — only users with access to the staging
+    # environment can trigger this workflow and read its secrets.
+    environment: staging
+
+    steps:
+      # ------------------------------------------------------------------ #
+      # 1. Checkout                                                          #
+      # ------------------------------------------------------------------ #
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ------------------------------------------------------------------ #
+      # 2. Set up Python                                                     #
+      # ------------------------------------------------------------------ #
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: load-tests/requirements.txt
+
+      # ------------------------------------------------------------------ #
+      # 3. Install load test dependencies                                    #
+      # ------------------------------------------------------------------ #
+      - name: Install load test dependencies
+        run: pip install -r load-tests/requirements.txt
+
+      # ------------------------------------------------------------------ #
+      # 4. Run unit tests for the load test scripts                         #
+      # ------------------------------------------------------------------ #
+      - name: Run load test unit tests
+        run: pytest load-tests/tests/ -v --tb=short
+
+      # ------------------------------------------------------------------ #
+      # 5. Create results directory                                          #
+      # ------------------------------------------------------------------ #
+      - name: Create results directory
+        run: mkdir -p load-tests/results
+
+      # ------------------------------------------------------------------ #
+      # 6. Run the load test                                                 #
+      # ------------------------------------------------------------------ #
+      - name: Run WebSocket load test
+        env:
+          TARGET_HOST: ${{ secrets.STAGING_URL }}
+          TEST_JWT_SECRET: ${{ secrets.TEST_JWT_SECRET }}
+          ROOMS_COUNT: ${{ github.event.inputs.rooms_count }}
+        run: |
+          locust \
+            -f load-tests/websocket_load.py \
+            --host "$TARGET_HOST" \
+            --users "${{ github.event.inputs.users }}" \
+            --spawn-rate "${{ github.event.inputs.spawn_rate }}" \
+            --run-time "${{ github.event.inputs.run_time }}" \
+            --headless \
+            --html load-tests/results/report.html \
+            --csv load-tests/results/metrics \
+            2>&1 | tee load-tests/results/locust.log
+        # Allow the step to fail without cancelling artifact upload
+        continue-on-error: true
+
+      # ------------------------------------------------------------------ #
+      # 7. Check SLO pass/fail in the log                                   #
+      # ------------------------------------------------------------------ #
+      - name: Evaluate SLO result
+        id: slo_check
+        run: |
+          if grep -q "ALL SLOs PASSED" load-tests/results/locust.log; then
+            echo "slo_status=PASS" >> "$GITHUB_OUTPUT"
+            echo "✅ All WebSocket SLOs passed."
+          else
+            echo "slo_status=FAIL" >> "$GITHUB_OUTPUT"
+            echo "❌ One or more WebSocket SLOs failed — see report artifact."
+          fi
+
+      # ------------------------------------------------------------------ #
+      # 8. Annotate summary                                                  #
+      # ------------------------------------------------------------------ #
+      - name: Write job summary
+        if: always()
+        run: |
+          echo "## WebSocket Load Test Results" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Parameter | Value |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|---|---|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Target | \`${{ secrets.STAGING_URL }}\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Users | ${{ github.event.inputs.users }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Rooms | ${{ github.event.inputs.rooms_count }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Duration | ${{ github.event.inputs.run_time }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| SLO result | ${{ steps.slo_check.outputs.slo_status }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "### p95 latency excerpts" >> "$GITHUB_STEP_SUMMARY"
+          echo "\`\`\`" >> "$GITHUB_STEP_SUMMARY"
+          grep -E "(p95|PASS|FAIL|SLO)" load-tests/results/locust.log \
+            || echo "(no SLO output found)" >> "$GITHUB_STEP_SUMMARY"
+          echo "\`\`\`" >> "$GITHUB_STEP_SUMMARY"
+
+      # ------------------------------------------------------------------ #
+      # 9. Upload report artifacts                                           #
+      # ------------------------------------------------------------------ #
+      - name: Upload load test report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: load-test-report-${{ github.run_id }}
+          path: |
+            load-tests/results/report.html
+            load-tests/results/metrics_*.csv
+            load-tests/results/locust.log
+          retention-days: 30
+
+      # ------------------------------------------------------------------ #
+      # 10. Fail the job if the SLO check failed                            #
+      # ------------------------------------------------------------------ #
+      - name: Fail if SLOs not met
+        if: steps.slo_check.outputs.slo_status != 'PASS'
+        run: |
+          echo "::error::WebSocket SLOs not met — p95 latency exceeded 150ms. See the uploaded report artifact."
+          exit 1
