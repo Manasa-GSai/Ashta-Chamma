@@ -1,74 +1,73 @@
-"""FastAPI application factory for Ashta Chamma 3D backend.
+"""FastAPI application entry point.
 
-The module exposes a single ``app`` instance that is referenced by the
-Uvicorn entrypoint: ``uvicorn app.main:app --reload``.
+Creates the ``app`` instance, registers all API routers, and manages the
+application lifespan (startup / shutdown hooks).
 
-Routers for rooms, users, scores, and WebSocket endpoints will be mounted
-here by subsequent work orders.  For now the app wires in:
-* A health-check endpoint (``GET /api/health``).
-* Structured JSON error handlers.
-* CORS middleware.
+Lifespan responsibilities:
+- Initialise the Redis connection pool from ``REDIS_URL`` env var.
+- Close the pool cleanly on shutdown to release ElastiCache connections.
+
+REDIS_URL must be provided via the environment (injected from AWS Secrets
+Manager at container start). It defaults to a local Redis instance for
+development convenience only.
 """
+
+from __future__ import annotations
 
 import logging
 import os
+from collections.abc import AsyncGenerator
+from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, Request, status
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi import FastAPI
 
+import app.redis as redis_module
 from app import __version__
+from app.redis import RedisManager
+from app.routes.health import router as health_router
 
-logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s %(message)s")
 logger = logging.getLogger(__name__)
+
+
+@asynccontextmanager
+async def lifespan(application: FastAPI) -> AsyncGenerator[None, None]:
+    """Manage startup and shutdown lifecycle for shared resources.
+
+    On startup the Redis pool is initialised; on shutdown it is closed.
+    Failures during Redis initialisation are non-fatal — the application
+    continues without caching (see RedisManager.initialize).
+    """
+    # ---- startup ----
+    redis_url = os.getenv("REDIS_URL", "redis://localhost:6379")
+    manager = RedisManager(redis_url)
+    await manager.initialize()
+    # Store the live manager in the module-level singleton so all routers and
+    # services that import `app.redis.redis_manager` see the same instance.
+    redis_module.redis_manager = manager
+    logger.info(
+        "Application startup complete (version=%s, redis_connected=%s)",
+        __version__,
+        manager.is_connected,
+    )
+
+    yield
+
+    # ---- shutdown ----
+    if redis_module.redis_manager is not None:
+        await redis_module.redis_manager.close()
+        redis_module.redis_manager = None
+    logger.info("Application shutdown complete")
+
 
 app = FastAPI(
     title="Ashta Chamma 3D API",
+    description="Backend API for the Ashta Chamma 3D multiplayer board game.",
     version=__version__,
-    docs_url="/api/docs",
-    redoc_url="/api/redoc",
-    openapi_url="/api/openapi.json",
+    lifespan=lifespan,
 )
 
 # ---------------------------------------------------------------------------
-# CORS — allow the Vite dev server and production CloudFront origin.
+# Routers
 # ---------------------------------------------------------------------------
 
-_allowed_origins = [
-    o.strip()
-    for o in os.environ.get("CORS_ALLOWED_ORIGINS", "http://localhost:5173").split(",")
-    if o.strip()
-]
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=_allowed_origins,
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-
-# ---------------------------------------------------------------------------
-# Global exception handlers
-# ---------------------------------------------------------------------------
-
-
-@app.exception_handler(Exception)
-async def _unhandled_exception_handler(request: Request, exc: Exception) -> JSONResponse:
-    logger.exception("Unhandled exception on %s %s", request.method, request.url.path)
-    return JSONResponse(
-        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-        content={"error": "internal_server_error"},
-    )
-
-
-# ---------------------------------------------------------------------------
-# Health check
-# ---------------------------------------------------------------------------
-
-
-@app.get("/api/health", tags=["ops"])
-async def health() -> dict[str, str]:
-    """Liveness probe used by the ECS ALB health check and CI smoke tests."""
-    return {"status": "ok", "version": __version__}
+app.include_router(health_router, prefix="/api")
