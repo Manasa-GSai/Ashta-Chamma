@@ -19,6 +19,10 @@ dist-ssr/
 .vite/
 *.tsbuildinfo
 
+# CDK infrastructure
+cdk.out/
+infra/dist/
+
 # Editor / OS
 .DS_Store
 *.log
@@ -33,3 +37,4 @@ dist-ssr/
 .forge-commit-ready
 .forge/project-id
 .claude/hooks/
+CLAUDE.md
