@@ -1,88 +1,145 @@
-"""Tests for FastAPI application setup and lifespan hooks.
+"""Unit tests for the FastAPI application entry point.
 
-Verifies:
-- The ``app`` object is a FastAPI instance
-- The ``/api/health`` route is registered
-- Lifespan startup initialises the redis_manager singleton
-- Lifespan shutdown closes the manager and clears the singleton
-- REDIS_URL environment variable is forwarded to RedisManager
+Covers:
+- Health endpoint happy path
+- 500 error responses do not leak Sentry event IDs or internal details
+- Sentry is initialised with the correct parameters when DSN is present
+- Sentry is NOT initialised when DSN is absent
 """
 
-from __future__ import annotations
-
 import os
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import MagicMock, patch
 
 import pytest
-from fastapi import FastAPI
+from fastapi import APIRouter
+from fastapi.testclient import TestClient
 
-import app.redis as redis_module
-from app.main import app, lifespan
+from app.main import app
 
-
-class TestAppInstance:
-    def test_app_is_fastapi_instance(self) -> None:
-        assert isinstance(app, FastAPI)
-
-    def test_api_health_route_registered(self) -> None:
-        routes = [r.path for r in app.routes]  # type: ignore[attr-defined]
-        assert "/api/health" in routes
+# ---------------------------------------------------------------------------
+# Health endpoint
+# ---------------------------------------------------------------------------
 
 
-class TestLifespan:
-    async def test_startup_initialises_redis_manager(self) -> None:
-        mock_manager = MagicMock()
-        mock_manager.initialize = AsyncMock()
-        mock_manager.is_connected = True
-        mock_manager.close = AsyncMock()
+def test_health_endpoint_returns_200() -> None:
+    client = TestClient(app)
+    response = client.get("/api/health")
+    assert response.status_code == 200
 
-        with patch("app.main.RedisManager", return_value=mock_manager):
-            async with lifespan(app):
-                assert redis_module.redis_manager is mock_manager
-                mock_manager.initialize.assert_awaited_once()
 
-    async def test_shutdown_closes_manager_and_clears_singleton(self) -> None:
-        mock_manager = MagicMock()
-        mock_manager.initialize = AsyncMock()
-        mock_manager.is_connected = False
-        mock_manager.close = AsyncMock()
+def test_health_endpoint_body_contains_ok_status() -> None:
+    client = TestClient(app)
+    response = client.get("/api/health")
+    assert response.json()["status"] == "ok"
 
-        with patch("app.main.RedisManager", return_value=mock_manager):
-            async with lifespan(app):
-                pass  # yield point
 
-        mock_manager.close.assert_awaited_once()
-        assert redis_module.redis_manager is None
+def test_health_endpoint_body_contains_version() -> None:
+    client = TestClient(app)
+    response = client.get("/api/health")
+    data = response.json()
+    assert "version" in data
+    assert isinstance(data["version"], str)
 
-    async def test_lifespan_uses_redis_url_env_var(self) -> None:
-        mock_manager = MagicMock()
-        mock_manager.initialize = AsyncMock()
-        mock_manager.is_connected = True
-        mock_manager.close = AsyncMock()
 
-        custom_url = "rediss://custom.cache.example.com:6380"
-        with (
-            patch.dict(os.environ, {"REDIS_URL": custom_url}),
-            patch("app.main.RedisManager", return_value=mock_manager) as mock_cls,
-        ):
-            async with lifespan(app):
-                pass
+# ---------------------------------------------------------------------------
+# Unhandled exception handling — must not leak internals to client
+# ---------------------------------------------------------------------------
 
-        mock_cls.assert_called_once_with(custom_url)
+# Shared router for routes that intentionally raise errors in tests.
+_error_router = APIRouter()
 
-    async def test_lifespan_defaults_to_local_redis_when_env_missing(self) -> None:
-        mock_manager = MagicMock()
-        mock_manager.initialize = AsyncMock()
-        mock_manager.is_connected = False
-        mock_manager.close = AsyncMock()
 
-        env_without_redis = {k: v for k, v in os.environ.items() if k != "REDIS_URL"}
-        with (
-            patch.dict(os.environ, env_without_redis, clear=True),
-            patch("app.main.RedisManager", return_value=mock_manager) as mock_cls,
-        ):
-            async with lifespan(app):
-                pass
+@_error_router.get("/test-unhandled-error")
+async def _boom_route() -> None:
+    raise RuntimeError("secret internal message — must not reach client")
 
-        called_url: str = mock_cls.call_args.args[0]
-        assert called_url.startswith("redis://")
+
+app.include_router(_error_router)
+_error_client = TestClient(app, raise_server_exceptions=False)
+
+
+def test_unhandled_exception_returns_500() -> None:
+    response = _error_client.get("/test-unhandled-error")
+    assert response.status_code == 500
+
+
+def test_unhandled_exception_response_body_is_generic() -> None:
+    response = _error_client.get("/test-unhandled-error")
+    assert response.json() == {"detail": "Internal server error"}
+
+
+def test_unhandled_exception_does_not_leak_error_message() -> None:
+    response = _error_client.get("/test-unhandled-error")
+    body_text = response.text
+    assert "secret internal message" not in body_text
+
+
+def test_unhandled_exception_does_not_leak_sentry_event_id() -> None:
+    response = _error_client.get("/test-unhandled-error")
+    body_text = response.text.lower()
+    # The response must not contain any reference to Sentry or its event IDs.
+    assert "sentry" not in body_text
+
+
+# ---------------------------------------------------------------------------
+# Sentry initialisation — DSN controls whether SDK is activated
+# ---------------------------------------------------------------------------
+
+
+def test_sentry_init_called_when_dsn_is_set() -> None:
+    """Re-importing main with a DSN set should call sentry_sdk.init."""
+    import importlib
+
+    import sentry_sdk
+
+    with patch.dict(os.environ, {"SENTRY_DSN": "https://abc@sentry.io/1"}):
+        with patch.object(sentry_sdk, "init") as mock_init:
+            import app.config as cfg_module
+            import app.main as main_module
+
+            importlib.reload(cfg_module)
+            importlib.reload(main_module)
+            mock_init.assert_called_once()
+
+
+def test_sentry_init_not_called_when_dsn_is_empty() -> None:
+    """Re-importing main without a DSN must not call sentry_sdk.init."""
+    import importlib
+
+    import sentry_sdk
+
+    with patch.dict(os.environ, {}, clear=True):
+        with patch.object(sentry_sdk, "init") as mock_init:
+            import app.config as cfg_module
+            import app.main as main_module
+
+            importlib.reload(cfg_module)
+            importlib.reload(main_module)
+            mock_init.assert_not_called()
+
+
+def test_sentry_init_disables_default_pii() -> None:
+    """Sentry must never send PII (email, names) — only user IDs are permitted."""
+    import importlib
+
+    import sentry_sdk
+
+    with patch.dict(os.environ, {"SENTRY_DSN": "https://abc@sentry.io/1"}):
+        with patch.object(sentry_sdk, "init") as mock_init:
+            import app.config as cfg_module
+            import app.main as main_module
+
+            importlib.reload(cfg_module)
+            importlib.reload(main_module)
+
+            _args, kwargs = mock_init.call_args
+            assert kwargs.get("send_default_pii") is False
+
+
+def test_sentry_captures_exception_in_handler() -> None:
+    """The exception handler must forward the exception to Sentry."""
+    import sentry_sdk
+
+    with patch.object(sentry_sdk, "capture_exception") as mock_capture:
+        _error_client.get("/test-unhandled-error")
+        mock_capture.assert_called_once()

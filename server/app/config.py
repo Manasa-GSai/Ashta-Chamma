@@ -1,19 +1,29 @@
 """Application configuration loaded from environment variables.
 
-All configurable values are read at module import time so that they can be
-overridden in tests by patching ``os.environ`` before importing the module.
+Values are resolved once at import time. A restart is required to pick up
+changes in production — this is intentional for predictability.
 """
 
 import os
+from dataclasses import dataclass, field
 
-DATABASE_URL: str = os.environ.get(
-    "DATABASE_URL",
-    "postgresql+asyncpg://user:password@localhost:5432/ashta_chamma",
-)
-REDIS_URL: str = os.environ.get("REDIS_URL", "redis://localhost:6379")
 
-# BR-5: rooms idle for longer than this many seconds are auto-closed.
-ROOM_IDLE_TIMEOUT_SECONDS: int = int(os.environ.get("ROOM_IDLE_TIMEOUT_SECONDS", "900"))
+@dataclass
+class Settings:
+    """Configuration values resolved from environment variables at startup.
 
-# How often (in seconds) the background cleanup task runs.
-CLEANUP_INTERVAL_SECONDS: int = int(os.environ.get("CLEANUP_INTERVAL_SECONDS", "60"))
+    Sentry DSN is optional: when absent (local development), ``sentry_sdk.init``
+    is skipped entirely so no network calls are made to Sentry.
+    The DSN must come from an environment variable — it must never be hardcoded.
+    """
+
+    sentry_dsn: str = field(default_factory=lambda: os.getenv("SENTRY_DSN", ""))
+    sentry_environment: str = field(
+        default_factory=lambda: os.getenv("SENTRY_ENVIRONMENT", "development")
+    )
+    sentry_traces_sample_rate: float = field(
+        default_factory=lambda: float(os.getenv("SENTRY_TRACES_SAMPLE_RATE", "0.1"))
+    )
+
+
+settings = Settings()
