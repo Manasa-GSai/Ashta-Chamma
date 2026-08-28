@@ -1,1 +1,1 @@
-"""Repository interfaces and implementations."""
+"""Repository modules — thin CRUD/query wrappers over the data layer."""

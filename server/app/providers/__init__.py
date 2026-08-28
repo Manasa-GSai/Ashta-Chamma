@@ -1,1 +1,1 @@
-"""External service provider interfaces (protocols)."""
+"""Infrastructure provider modules (Redis, DB pools, etc.)."""

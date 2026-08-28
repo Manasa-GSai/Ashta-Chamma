@@ -1,201 +1,346 @@
-"""WebSocket route handler for real-time in-game communication.
+"""WebSocket endpoint for real-time Ashta Chamma game communication.
 
-All in-game communication — including game state updates, cowrie roll results,
-and chat messages — flows through this module. Each room has its own broadcast
-group; connections are stored in a module-level registry keyed by room_id.
+Endpoint: ``wss://host/ws/rooms/{room_id}?token={jwt}``
 
-Chat messages are ephemeral (not persisted to the database). HTML tags are
-stripped before broadcast to prevent XSS. See OWASP A05 constraint in WO-025.
+Connection lifecycle
+--------------------
+1. JWT validated from ``?token=`` query param — close 4001 on failure.
+2. ``websocket.accept()`` called only after successful auth.
+3. Reconnection check: if the player has a disconnection record in Redis
+   (within the 60-second window), the full game state is sent immediately.
+4. Redis pub/sub listener started as a background ``asyncio.Task``.
+5. Message loop: receive text, enforce 1 KB limit, parse/validate JSON,
+   route by ``type`` field.
+6. On disconnect: background task cancelled, player marked as disconnected
+   in Redis with a 60-second TTL (reconnection window).
+
+Fan-out strategy
+----------------
+All game-state broadcasts go through Redis pub/sub on channel
+``room:{room_id}``.  The Redis listener task on every ECS instance that
+has connections to that room forwards received messages to those WebSockets.
+This ensures correct behaviour under horizontal scaling (AC-5).
+
+Security constraints
+--------------------
+- JWT validated once on connection, not per message (constraint §2).
+- Game actions validated server-side (constraint §3).
+- Never trust the client — all roll and move results come from server logic.
+- Messages rejected after schema validation failure, not silently ignored.
 """
 
 from __future__ import annotations
 
+import asyncio
+import json
 import logging
-import re
-from collections import defaultdict
-from datetime import datetime, timezone
 from typing import Any
 
-from fastapi import APIRouter, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, Query, WebSocket, WebSocketDisconnect, WebSocketException
 
-logger = logging.getLogger(__name__)
+from app.dependencies.auth import ws_authenticate
+from app.providers.redis import get_redis
+from app.repositories.audit_log import write_audit_log
+from app.schemas.websocket import (
+    MAX_MESSAGE_BYTES,
+    ErrorMessage,
+    GameStateUpdateMessage,
+    PingMessage,
+    PongMessage,
+    RollRequestMessage,
+    RollResultMessage,
+    SelectPawnMessage,
+    StateUpdateMessage,
+    parse_client_message,
+)
+from app.services.connection_manager import manager as connection_manager
+from app.services.game_session import GameSession
 
-router = APIRouter()
+router = APIRouter(tags=["websocket"])
 
-# In-memory connection registry: room_id -> list of (websocket, player_info)
-# player_info keys: user_id, display_name, color
-# Replaced by Redis pub/sub when the PubSubBridge work order lands; keeping
-# this in-memory for single-task correctness in the current phase.
-_room_connections: dict[str, list[tuple[WebSocket, dict[str, str]]]] = defaultdict(list)
+_logger = logging.getLogger(__name__)
 
-_MAX_CHAT_LENGTH: int = 200
-
-# Regex to strip any HTML/XML-style tags.  Compiled once at module load.
-_HTML_TAG_RE: re.Pattern[str] = re.compile(r"<[^>]*>")
-
-
-def _sanitize_chat_text(text: str) -> str:
-    """Strip HTML tags from *text* and trim surrounding whitespace.
-
-    Removing tags (rather than escaping them) ensures the stored/broadcast
-    value is plain text that React can render without double-encoding issues.
-    Any residual `<` / `>` that were not part of a well-formed tag survive
-    harmlessly as literal characters; the React client escapes them on render.
-
-    Args:
-        text: Raw chat message string received from the client.
-
-    Returns:
-        Sanitized plain-text string.
-    """
-    without_tags = _HTML_TAG_RE.sub("", text)
-    return without_tags.strip()
-
-
-async def _broadcast_to_room(room_id: str, message: dict[str, Any]) -> None:
-    """Send *message* as JSON to every WebSocket client connected to *room_id*.
-
-    Silently removes connections that fail to receive the message (the client
-    has likely disconnected without sending a close frame).
-    """
-    stale: list[tuple[WebSocket, dict[str, str]]] = []
-    for ws, player_info in list(_room_connections[room_id]):
-        try:
-            await ws.send_json(message)
-        except Exception:
-            logger.warning(
-                "Failed to send message to player %s; marking connection stale",
-                player_info.get("display_name"),
-            )
-            stale.append((ws, player_info))
-    for item in stale:
-        try:
-            _room_connections[room_id].remove(item)
-        except ValueError:
-            pass  # Already removed by a concurrent handler
+# Redis key prefix for disconnected-player records used in reconnect logic.
+_DISCONNECT_KEY_PREFIX: str = "disconnected"
+# How long (seconds) to keep a disconnection record so reconnects restore state.
+_RECONNECT_WINDOW_SECONDS: int = 60
 
 
 @router.websocket("/ws/rooms/{room_id}")
-async def room_websocket(websocket: WebSocket, room_id: str) -> None:
-    """Handle WebSocket connections for a specific game room.
+async def websocket_endpoint(
+    websocket: WebSocket,
+    room_id: str,
+    token: str = Query(default=""),
+) -> None:
+    """Real-time WebSocket handler for a single game room.
 
-    Query parameters accepted on upgrade:
-    - ``token``: Clerk JWT (validated by AuthMiddleware in WO-016)
-    - ``user_id``: Player UUID (placeholder until AuthMiddleware injects context)
-    - ``display_name``: Player display name shown in chat
-    - ``color``: Player colour hex string (e.g. ``#e74c3c``)
+    Authentication is performed before ``accept()`` by catching the
+    ``WebSocketException`` and closing with the appropriate code, which
+    causes Starlette to perform a reject-on-upgrade internally.
     """
+    # ------------------------------------------------------------------
+    # Step 1: Authenticate.  Close 4001 before accepting on failure.
+    # ------------------------------------------------------------------
+    try:
+        claims = ws_authenticate(token)
+    except WebSocketException:
+        await websocket.close(code=4001)
+        return
+
+    player_id: str = claims.get("sub", "") or claims.get("user_id", "")
+    if not player_id:
+        await websocket.close(code=4001)
+        return
+
+    # ------------------------------------------------------------------
+    # Step 2: Accept connection and register with the in-process manager.
+    # ------------------------------------------------------------------
     await websocket.accept()
+    connection_manager.register(room_id, player_id, websocket)
 
-    # Placeholder identity extraction from query params.
-    # Full Clerk JWT validation and user-context injection is handled by the
-    # auth middleware introduced in WO-016; these defaults maintain backwards
-    # compatibility during the transition.
-    player_info: dict[str, str] = {
-        "user_id": websocket.query_params.get("user_id", "anonymous"),
-        "display_name": websocket.query_params.get("display_name", "Player"),
-        "color": websocket.query_params.get("color", "#ffffff"),
-    }
+    redis = await get_redis()
+    game_session = GameSession(room_id=room_id, redis=redis)
 
-    _room_connections[room_id].append((websocket, player_info))
-    logger.info(
-        "Client connected to room %s; player=%s",
-        room_id,
-        player_info["display_name"],
+    # ------------------------------------------------------------------
+    # Step 3: Reconnection check — send full state if within window.
+    # ------------------------------------------------------------------
+    disconnect_key = f"{_DISCONNECT_KEY_PREFIX}:{room_id}:{player_id}"
+    was_disconnected: int = await redis.exists(disconnect_key)
+    if was_disconnected:
+        await redis.delete(disconnect_key)
+        full_state = await game_session.get_state()
+        await websocket.send_json(StateUpdateMessage(state=full_state).model_dump())
+        _logger.info(
+            "Player %s reconnected to room %s; full state sent", player_id, room_id
+        )
+
+    # ------------------------------------------------------------------
+    # Step 4: Start Redis pub/sub listener (cross-instance fan-out).
+    # ------------------------------------------------------------------
+    listener_task: asyncio.Task[None] = asyncio.create_task(
+        _redis_pubsub_listener(room_id, player_id, websocket),
+        name=f"redis-listener:{room_id}:{player_id}",
     )
 
     try:
+        # --------------------------------------------------------------
+        # Step 5: Message loop.
+        # --------------------------------------------------------------
         while True:
-            data: Any = await websocket.receive_json()
-            if isinstance(data, dict):
-                await _handle_message(websocket, room_id, player_info, data)
+            raw: str = await websocket.receive_text()
+
+            # Enforce 1 KB per-message limit (OWASP / constraint §6).
+            if len(raw.encode("utf-8")) > MAX_MESSAGE_BYTES:
+                await websocket.send_json(
+                    ErrorMessage(message="Message exceeds maximum allowed size").model_dump()
+                )
+                continue
+
+            # Parse JSON.
+            try:
+                data: dict[str, Any] = json.loads(raw)
+            except json.JSONDecodeError:
+                await websocket.send_json(ErrorMessage(message="Invalid JSON").model_dump())
+                continue
+
+            # Validate against schema.
+            try:
+                msg = parse_client_message(data)
+            except Exception:
+                await websocket.send_json(
+                    ErrorMessage(message="Unknown or invalid message type").model_dump()
+                )
+                continue
+
+            await _dispatch(
+                msg=msg,
+                room_id=room_id,
+                player_id=player_id,
+                websocket=websocket,
+                game_session=game_session,
+                redis=redis,
+            )
+
     except WebSocketDisconnect:
-        logger.info(
-            "Client disconnected from room %s; player=%s",
-            room_id,
-            player_info["display_name"],
-        )
+        _logger.info("Player %s disconnected from room %s", player_id, room_id)
     finally:
-        connections = _room_connections.get(room_id, [])
-        try:
-            connections.remove((websocket, player_info))
-        except ValueError:
-            pass  # Already cleaned up by _broadcast_to_room
+        # ------------------------------------------------------------------
+        # Step 6: Clean up — cancel listener, deregister, mark disconnected.
+        # ------------------------------------------------------------------
+        listener_task.cancel()
+        connection_manager.deregister(room_id, player_id, websocket)
+
+        # Preserve a disconnection record so reconnects within 60 s restore state.
+        await redis.setex(disconnect_key, _RECONNECT_WINDOW_SECONDS, "1")
+        _logger.info(
+            "Player %s marked disconnected in room %s (TTL=%ds)",
+            player_id,
+            room_id,
+            _RECONNECT_WINDOW_SECONDS,
+        )
 
 
-async def _handle_message(
-    websocket: WebSocket,
+# ---------------------------------------------------------------------------
+# Message dispatch
+# ---------------------------------------------------------------------------
+
+
+async def _dispatch(
+    msg: RollRequestMessage | SelectPawnMessage | PingMessage,
     room_id: str,
-    player_info: dict[str, str],
-    data: dict[str, Any],
-) -> None:
-    """Dispatch an incoming WebSocket message to the appropriate sub-handler."""
-    msg_type = data.get("type")
-
-    if msg_type == "chat":
-        await _handle_chat(websocket, room_id, player_info, data)
-    elif msg_type == "ping":
-        await websocket.send_json({"type": "pong"})
-    else:
-        logger.debug("Unhandled message type %r in room %s", msg_type, room_id)
-
-
-async def _handle_chat(
+    player_id: str,
     websocket: WebSocket,
-    room_id: str,
-    player_info: dict[str, str],
-    data: dict[str, Any],
+    game_session: GameSession,
+    redis: Any,
 ) -> None:
-    """Validate and broadcast a chat message to every member of *room_id*.
+    """Route a validated client message to the appropriate handler."""
+    # Ping is handled directly — no turn validation required.
+    if isinstance(msg, PingMessage):
+        await websocket.send_json(PongMessage().model_dump())
+        return
 
-    Validation rules (per WO-025 acceptance criteria):
-    1. ``text`` field must be a string.
-    2. After HTML-tag stripping, the message must be non-empty.
-    3. Sanitized text must not exceed ``_MAX_CHAT_LENGTH`` characters.
+    # All game actions require it to be the player's turn.
+    current_player = await game_session.get_current_player()
+    # When no current player is set (game not yet started / state not initialised)
+    # we allow the action so the first roll can kick things off.
+    if current_player and current_player != player_id:
+        await websocket.send_json(
+            ErrorMessage(message="Not your turn").model_dump()
+        )
+        return
 
-    On success the broadcast payload type is ``chat_broadcast`` and includes
-    ``sender_name``, ``sender_color``, ``text``, and an ISO-8601 UTC
-    ``timestamp``.
+    if isinstance(msg, RollRequestMessage):
+        await _handle_roll_request(
+            room_id=room_id,
+            player_id=player_id,
+            game_session=game_session,
+            redis=redis,
+        )
+    elif isinstance(msg, SelectPawnMessage):
+        await _handle_select_pawn(
+            room_id=room_id,
+            player_id=player_id,
+            pawn_id=msg.pawn_id,
+            game_session=game_session,
+            redis=redis,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Game action handlers
+# ---------------------------------------------------------------------------
+
+
+async def _handle_roll_request(
+    room_id: str,
+    player_id: str,
+    game_session: GameSession,
+    redis: Any,
+) -> None:
+    """Execute a cowrie roll and publish the result to all room members.
+
+    The result is published to Redis pub/sub so every ECS instance forwards
+    it to their locally-connected clients (AC-5 fan-out requirement).
     """
-    raw_text: Any = data.get("text", "")
+    result = await game_session.roll(player_id)
 
-    if not isinstance(raw_text, str):
-        await websocket.send_json(
-            {
-                "type": "error",
-                "code": "INVALID_CHAT",
-                "message": "Chat text must be a string.",
-            }
+    roll_msg = RollResultMessage(
+        value=result["value"],
+        shells=result["shells"],
+        player_id=result["player_id"],
+    )
+    channel = f"room:{room_id}"
+    await redis.publish(channel, json.dumps(roll_msg.model_dump()))
+
+    # Audit trail (AC-8).
+    await write_audit_log(
+        actor_id=player_id,
+        action="game.roll",
+        entity_type="room",
+        entity_id=room_id,
+        metadata={"value": result["value"]},
+    )
+
+
+async def _handle_select_pawn(
+    room_id: str,
+    player_id: str,
+    pawn_id: int,
+    game_session: GameSession,
+    redis: Any,
+) -> None:
+    """Execute a pawn selection/move and broadcast the state delta.
+
+    The state delta is published to Redis pub/sub (AC-5 fan-out requirement).
+    """
+    state_delta = await game_session.select_pawn(player_id, pawn_id)
+
+    update_msg = GameStateUpdateMessage(state_delta=state_delta)
+    channel = f"room:{room_id}"
+    await redis.publish(channel, json.dumps(update_msg.model_dump()))
+
+    # Audit trail (AC-8).
+    await write_audit_log(
+        actor_id=player_id,
+        action="game.move",
+        entity_type="room",
+        entity_id=room_id,
+        metadata={"pawn_id": pawn_id},
+    )
+
+
+# ---------------------------------------------------------------------------
+# Redis pub/sub listener (background task)
+# ---------------------------------------------------------------------------
+
+
+async def _redis_pubsub_listener(
+    room_id: str,
+    player_id: str,
+    websocket: WebSocket,
+) -> None:
+    """Subscribe to ``room:{room_id}`` and forward messages to *websocket*.
+
+    Runs as an ``asyncio.Task`` for the lifetime of the WebSocket connection.
+    A dedicated ``pubsub()`` object is used because once subscribed, a Redis
+    connection can only issue subscribe/unsubscribe commands — it cannot be
+    shared with regular commands.
+
+    On ``CancelledError`` (raised when the connection closes), the subscription
+    is cleaned up gracefully.
+    """
+    from app.providers.redis import get_redis as _get_redis
+
+    redis = await _get_redis()
+    pubsub = redis.pubsub()
+    channel = f"room:{room_id}"
+    await pubsub.subscribe(channel)
+    _logger.debug(
+        "Redis pub/sub listener started for room=%s player=%s", room_id, player_id
+    )
+
+    try:
+        async for raw_msg in pubsub.listen():
+            # ``listen()`` yields subscribe-confirmation messages first.
+            if raw_msg.get("type") != "message":
+                continue
+            try:
+                payload: dict[str, Any] = json.loads(raw_msg["data"])
+                await websocket.send_json(payload)
+            except WebSocketDisconnect:
+                # The WebSocket closed mid-send; stop listening.
+                break
+            except Exception:
+                _logger.exception(
+                    "Error forwarding pub/sub message to player %s in room %s",
+                    player_id,
+                    room_id,
+                )
+    except asyncio.CancelledError:
+        pass  # Task cancelled on disconnect — expected path
+    finally:
+        await pubsub.unsubscribe(channel)
+        await pubsub.aclose()
+        _logger.debug(
+            "Redis pub/sub listener stopped for room=%s player=%s", room_id, player_id
         )
-        return
-
-    sanitized = _sanitize_chat_text(raw_text)
-
-    if not sanitized:
-        await websocket.send_json(
-            {
-                "type": "error",
-                "code": "EMPTY_MESSAGE",
-                "message": "Chat message cannot be empty.",
-            }
-        )
-        return
-
-    if len(sanitized) > _MAX_CHAT_LENGTH:
-        await websocket.send_json(
-            {
-                "type": "error",
-                "code": "MESSAGE_TOO_LONG",
-                "message": f"Chat message exceeds the {_MAX_CHAT_LENGTH}-character limit.",
-            }
-        )
-        return
-
-    broadcast_payload: dict[str, Any] = {
-        "type": "chat_broadcast",
-        "sender_name": player_info["display_name"],
-        "sender_color": player_info["color"],
-        "text": sanitized,
-        "timestamp": datetime.now(tz=timezone.utc).isoformat(),
-    }
-    await _broadcast_to_room(room_id, broadcast_payload)

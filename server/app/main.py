@@ -1,22 +1,50 @@
-"""FastAPI application entry point.
+"""FastAPI application factory for the Ashta Chamma backend.
 
-Registers all routers and exposes the ASGI application object for uvicorn.
+This module creates and configures the ``FastAPI`` application instance.
+It wires all routers, registers lifespan handlers, and is the entry point
+for Uvicorn: ``uvicorn app.main:app``.
 """
+
+from __future__ import annotations
+
+from contextlib import asynccontextmanager
+from collections.abc import AsyncGenerator
 
 from fastapi import FastAPI
 
-from app.routes import rooms
+from app.providers.redis import close_redis
+from app.routes.websocket import router as websocket_router
+
+
+@asynccontextmanager
+async def _lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
+    """Handle application startup and shutdown events."""
+    # Nothing to initialise at startup — Redis pool is lazy.
+    yield
+    # Cleanly drain the Redis connection pool.
+    await close_redis()
+
 
 app = FastAPI(
     title="Ashta Chamma 3D API",
     version="0.1.0",
-    description="Server-authoritative backend for the Ashta Chamma 3D board game.",
+    description="Real-time multiplayer Ashta Chamma game server.",
+    lifespan=_lifespan,
 )
 
-app.include_router(rooms.router)
+# ---------------------------------------------------------------------------
+# Routers
+# ---------------------------------------------------------------------------
+
+app.include_router(websocket_router)
 
 
-@app.get("/api/health", tags=["meta"])
-async def health() -> dict[str, str]:
-    """Liveness probe — returns service version."""
+# ---------------------------------------------------------------------------
+# Utility endpoints
+# ---------------------------------------------------------------------------
+
+
+@app.get("/api/health", tags=["health"])
+async def health_check() -> dict[str, str]:
+    """Liveness/readiness health check for the ALB target group."""
     return {"status": "ok", "version": "0.1.0"}

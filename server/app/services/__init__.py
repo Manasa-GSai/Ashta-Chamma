@@ -1,1 +1,1 @@
-"""Application services — business logic layer."""
+"""Service modules for the Ashta Chamma FastAPI backend."""
