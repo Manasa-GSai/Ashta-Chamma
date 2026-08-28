@@ -1,0 +1,158 @@
+name: Deploy
+
+on:
+  push:
+    branches:
+      - main
+      - master
+  workflow_dispatch:
+
+env:
+  # Staging environment URL — override via GitHub environment variables.
+  STAGING_URL: ${{ vars.STAGING_URL || 'http://localhost:5173' }}
+
+jobs:
+  # ── Lint & unit tests ────────────────────────────────────────────────────
+  test:
+    name: Lint and Unit Tests
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: client
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: client/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Format check
+        run: npm run format:check
+
+      - name: Type check
+        run: npx tsc --noEmit
+
+  # ── Build & push container image ─────────────────────────────────────────
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: client/package-lock.json
+
+      - name: Install client dependencies
+        working-directory: client
+        run: npm ci
+
+      - name: Build client
+        working-directory: client
+        run: npm run build
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: client-dist
+          path: client/dist/
+          retention-days: 7
+
+  # ── Deploy to staging ─────────────────────────────────────────────────────
+  deploy-staging:
+    name: Deploy to Staging
+    runs-on: ubuntu-latest
+    needs: build
+    environment: staging
+    concurrency:
+      group: staging-deploy
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download build artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: client-dist
+          path: client/dist/
+
+      - name: Deploy to staging
+        # Replace this step with your actual deployment command (CDK, S3 sync, etc.).
+        run: |
+          echo "Deploying to staging: ${STAGING_URL}"
+          # Example: aws s3 sync client/dist/ s3://${STAGING_BUCKET}/ --delete
+          # Example: aws ecs update-service --cluster staging --service api --force-new-deployment
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
+
+  # ── Playwright E2E tests (post-deploy, against staging) ──────────────────
+  e2e:
+    name: E2E Tests (Playwright)
+    runs-on: ubuntu-latest
+    needs: deploy-staging
+    environment: staging
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: client
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: client/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Install Playwright browsers
+        run: npx playwright install --with-deps chromium
+
+      - name: Run Playwright E2E tests
+        run: npx playwright test
+        env:
+          # Point tests at the freshly deployed staging environment.
+          E2E_BASE_URL: ${{ env.STAGING_URL }}
+          # Clerk testing token allows sign-in without the interactive UI.
+          # Store this as a GitHub Actions secret on the staging environment.
+          CLERK_TESTING_TOKEN: ${{ secrets.CLERK_TESTING_TOKEN }}
+          CI: 'true'
+
+      - name: Upload test report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-report
+          path: |
+            client/playwright-report/
+            client/test-results/
+          retention-days: 30
+
+      # Screenshots captured on failure live inside test-results/ — the artifact
+      # upload above includes them so engineers can download and inspect them.
+      - name: Upload failure screenshots
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-failure-screenshots
+          path: client/test-results/**/*.png
+          retention-days: 30
+          if-no-files-found: ignore
