@@ -1,1 +1,1 @@
-"""Route sub-package — FastAPI APIRouter instances, one module per domain."""
+"""FastAPI routers for the Ashta Chamma REST API."""
