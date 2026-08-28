@@ -1,6 +1,6 @@
-import { ClerkProvider } from '@clerk/clerk-react';
 import { StrictMode } from 'react';
 import { createRoot } from 'react-dom/client';
+import { I18nextProvider } from 'react-i18next';
 import * as Sentry from '@sentry/react';
 import { App } from './App';
 import i18n from './i18n';
@@ -46,12 +46,6 @@ if (!rootElement) {
   throw new Error('Root element #root not found in index.html');
 }
 
-const content = (
-  <I18nextProvider i18n={i18n}>
-    <App />
-  </I18nextProvider>
-);
-
 createRoot(rootElement).render(
   <StrictMode>
     {/*
@@ -62,7 +56,9 @@ createRoot(rootElement).render(
     <Sentry.ErrorBoundary
       fallback={<p>An unexpected error occurred. Our team has been notified.</p>}
     >
-      <App />
+      <I18nextProvider i18n={i18n}>
+        <App />
+      </I18nextProvider>
     </Sentry.ErrorBoundary>
   </StrictMode>,
 );
