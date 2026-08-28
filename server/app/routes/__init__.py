@@ -1,1 +1,1 @@
-"""Routes package for Ashta Chamma 3D backend."""
+"""API route package for Ashta Chamma 3D server."""

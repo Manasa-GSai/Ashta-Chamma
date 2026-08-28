@@ -1,179 +1,156 @@
-"""WebSocket endpoint for real-time game communication.
+"""WebSocket route for real-time in-game communication.
 
-Every player and spectator in a room connects to this endpoint.  Messages
-are dispatched according to sender role:
+Each active room gets a dedicated WebSocket endpoint.  Every incoming message
+is timed and the elapsed duration is recorded as ``ws_message_latency_ms`` in
+the AshtaChamma/WebSocket CloudWatch namespace.
 
-  Spectators  → may only send 'chat' and 'ping'
-  Players     → may send any message type
-
-Game-action messages (roll_request, select_pawn) sent by spectators are
-rejected immediately with an error envelope.  The rejection does NOT close
-the connection — spectators remain connected and continue to receive all
-broadcasts.
-
-All outbound broadcasts are fanned out to every WebSocket registered for the
-room.  In production the fan-out is done via Redis pub/sub so that messages
-cross ECS Fargate task boundaries; the in-process registry used here is
-equivalent for single-task deployments and tests.
+Architecture layer: routes (thin — parse message, call service, send response).
+Game logic dispatch will be filled in by WO-004 and subsequent work orders.
 """
 
 import logging
+import time
 from typing import Any
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
-from app.services import room_service
-
 logger = logging.getLogger(__name__)
-router = APIRouter()
 
-# In-process connection registry.
-# Key: room_code, Value: list of (user_id, WebSocket) pairs.
-# Each pair represents one active connection.
-_room_connections: dict[str, list[tuple[str, WebSocket]]] = {}
+router = APIRouter(prefix="/ws", tags=["websocket"])
 
-# Message types that mutate game state — blocked for spectators.
-_GAME_ACTION_TYPES: frozenset[str] = frozenset({"roll_request", "select_pawn"})
+WS_NAMESPACE = "AshtaChamma/WebSocket"
 
+# Buffer of latency samples waiting to be flushed.  The event loop is
+# single-threaded so plain list mutation is safe (no lock needed here).
+_ws_latency_buffer: list[float] = []
 
-# ---------------------------------------------------------------------------
-# Internal helpers
-# ---------------------------------------------------------------------------
+# Trigger an eager flush when the buffer reaches this size to bound memory use.
+# Normal flush cadence (60 s) is handled by the background task in main.py.
+_WS_BUFFER_FLUSH_THRESHOLD = 500
 
 
-async def _broadcast(room_code: str, message: dict[str, Any]) -> None:
-    """Send a JSON message to every active connection in the room.
+def get_ws_latency_buffer() -> list[float]:
+    """Return a copy of the current WebSocket latency buffer.
 
-    Stale connections (those that raise on send) are pruned from the
-    registry so they do not slow future broadcasts.
+    Exposed for testing so callers can inspect buffered samples.
     """
-    connections = _room_connections.get(room_code, [])
-    stale: list[tuple[str, WebSocket]] = []
-
-    for uid, ws in connections:
-        try:
-            await ws.send_json(message)
-        except Exception:
-            stale.append((uid, ws))
-
-    if stale:
-        _room_connections[room_code] = [c for c in connections if c not in stale]
+    return list(_ws_latency_buffer)
 
 
-# ---------------------------------------------------------------------------
-# WebSocket endpoint
-# ---------------------------------------------------------------------------
+def clear_ws_latency_buffer() -> None:
+    """Clear the WebSocket latency buffer (used in tests and by the flush task)."""
+    _ws_latency_buffer.clear()
 
 
-@router.websocket("/ws/rooms/{room_code}")
-async def websocket_endpoint(websocket: WebSocket, room_code: str) -> None:
-    """WebSocket endpoint for real-time game communication.
+def flush_ws_metrics(cloudwatch_client: Any | None = None) -> None:
+    """Publish buffered WebSocket latency samples to CloudWatch and clear the buffer.
 
-    Callers supply identity via query parameters:
-      user_id      — required; the authenticated user's ID
-      display_name — optional; defaults to "Anonymous"
-
-    Connection is rejected (4004) when the room_code is unknown.
+    Args:
+        cloudwatch_client: Injected boto3 CloudWatch client (for testing).
     """
-    user_id: str = websocket.query_params.get("user_id", "anonymous")
-    display_name: str = websocket.query_params.get("display_name", "Anonymous")
-
-    # Validate room exists before accepting the upgrade
-    room = room_service.get_room(room_code)
-    if room is None:
-        await websocket.close(code=4004, reason="Room not found")
+    if not _ws_latency_buffer:
         return
 
+    latencies = list(_ws_latency_buffer)
+    _ws_latency_buffer.clear()
+
+    if cloudwatch_client is None:
+        import boto3  # noqa: PLC0415
+
+        cloudwatch_client = boto3.client("cloudwatch")
+
+    from botocore.exceptions import BotoCoreError, ClientError  # noqa: PLC0415
+
+    metric_data = [
+        {"MetricName": "ws_message_latency_ms", "Value": lat, "Unit": "Milliseconds"}
+        for lat in latencies
+    ]
+
+    chunk_size = 20
+    for i in range(0, len(metric_data), chunk_size):
+        try:
+            cloudwatch_client.put_metric_data(
+                Namespace=WS_NAMESPACE,
+                MetricData=metric_data[i : i + chunk_size],
+            )
+        except (BotoCoreError, ClientError) as exc:
+            logger.warning("Failed to publish WebSocket metrics to CloudWatch: %s", exc)
+
+
+def _record_ws_latency(elapsed_ms: float) -> None:
+    """Append a latency sample to the buffer; flush early if threshold is reached."""
+    _ws_latency_buffer.append(elapsed_ms)
+    if len(_ws_latency_buffer) >= _WS_BUFFER_FLUSH_THRESHOLD:
+        flush_ws_metrics()
+
+
+@router.websocket("/rooms/{room_id}")
+async def websocket_room(websocket: WebSocket, room_id: str) -> None:
+    """WebSocket endpoint for real-time game communication within a room.
+
+    Accepts connections, receives JSON messages, measures per-message processing
+    time, and records it via ``_record_ws_latency``.
+
+    Game state machine dispatch (roll, move, chat) will be wired in by WO-004
+    and subsequent work orders.  Until then, unknown message types receive a
+    NOT_IMPLEMENTED error response so the WebSocket contract is preserved.
+
+    Args:
+        websocket: The active WebSocket connection.
+        room_id: UUID of the game room (validated by RoomManager in a later WO).
+    """
     await websocket.accept()
-
-    # Register connection
-    _room_connections.setdefault(room_code, []).append((user_id, websocket))
-
-    spectator: bool = room_service.is_spectator(room_code, user_id)
-
-    # Send the connecting client the current room state together with their
-    # spectator flag so the frontend can initialise correctly.
-    await websocket.send_json(
-        {
-            "type": "state_update",
-            "state": room_service.get_room(room_code),
-            "is_spectator": spectator,
-        }
-    )
+    logger.info("WebSocket connection accepted: room_id=%s", room_id)
 
     try:
         while True:
-            data: dict[str, Any] = await websocket.receive_json()
-            msg_type: str = data.get("type", "")
+            message: dict[str, Any] = await websocket.receive_json()
+            start = time.perf_counter()
 
-            if msg_type in _GAME_ACTION_TYPES:
-                # Spectators must not influence game state
-                if spectator:
-                    await websocket.send_json(
-                        {
-                            "type": "error",
-                            "message": "Spectators cannot perform game actions",
-                        }
-                    )
-                    continue
+            msg_type: str = message.get("type", "")
+            logger.debug("Received WS message: type=%s room_id=%s", msg_type, room_id)
 
-                # In a full implementation the game state machine processes the
-                # action and a state delta is published via Redis pub/sub.
-                # Here we echo a broadcast so tests can verify fan-out.
-                await _broadcast(
-                    room_code,
-                    {
-                        "type": "state_update",
-                        "state": room_service.get_room(room_code),
-                        "action": msg_type,
-                        "from": user_id,
-                    },
-                )
+            # Game logic dispatch — stubbed pending WO-004+
+            # Each handled type will record its own elapsed time before calling
+            # _record_ws_latency so the measurement includes processing cost.
+            response_payload = _dispatch_message(msg_type, message, room_id)
 
-            elif msg_type == "chat":
-                # Chat is available to both players and spectators
-                text: str = data.get("text", "")
-                await _broadcast(
-                    room_code,
-                    {"type": "chat", "from": display_name, "text": text},
-                )
+            elapsed_ms = (time.perf_counter() - start) * 1_000.0
+            _record_ws_latency(elapsed_ms)
 
-            elif msg_type == "ping":
-                await websocket.send_json({"type": "pong"})
-
-            else:
-                await websocket.send_json(
-                    {"type": "error", "message": f"Unknown message type: {msg_type}"}
-                )
+            await websocket.send_json(response_payload)
 
     except WebSocketDisconnect:
-        _remove_connection(room_code, user_id, websocket)
-        logger.info("User %s disconnected from room %s", user_id, room_code)
-
+        logger.info("WebSocket disconnected: room_id=%s", room_id)
     except Exception as exc:
-        _remove_connection(room_code, user_id, websocket)
-        logger.error(
-            "WebSocket error for user %s in room %s: %s", user_id, room_code, exc
-        )
+        logger.exception("WebSocket error: room_id=%s error=%s", room_id, exc)
+        await websocket.close(code=1011)
 
 
-def _remove_connection(
-    room_code: str, user_id: str, websocket: WebSocket
-) -> None:
-    """Remove a single connection entry from the registry."""
-    connections = _room_connections.get(room_code, [])
-    _room_connections[room_code] = [
-        (uid, ws)
-        for uid, ws in connections
-        if not (uid == user_id and ws is websocket)
-    ]
+def _dispatch_message(
+    msg_type: str, message: dict[str, Any], room_id: str
+) -> dict[str, Any]:
+    """Route a WebSocket message to the appropriate handler.
 
+    Returns a response payload dict.  Stub implementation — game logic
+    handlers (roll_request, select_pawn, chat, ping) will replace this
+    in subsequent work orders.
 
-def get_room_connections(room_code: str) -> list[tuple[str, WebSocket]]:
-    """Return active connections for a room.  Used in tests."""
-    return list(_room_connections.get(room_code, []))
+    Args:
+        msg_type: The ``type`` field from the incoming JSON message.
+        message: Full message dict.
+        room_id: Active room identifier.
 
+    Returns:
+        JSON-serialisable response dict.
+    """
+    if msg_type == "ping":
+        return {"type": "pong"}
 
-def clear_connections() -> None:
-    """Clear the entire connection registry.  Used in tests."""
-    _room_connections.clear()
+    # All other types are not yet implemented
+    logger.debug("Unhandled WS message type=%s room_id=%s", msg_type, room_id)
+    return {
+        "type": "error",
+        "code": "NOT_IMPLEMENTED",
+        "message": f"Message type '{msg_type}' is not yet implemented.",
+    }

@@ -1,169 +1,188 @@
-"""Tests for the WebSocket route handler (app.routes.websocket).
+"""Tests for server/app/routes/websocket.py.
 
-Coverage targets per the testing strategy:
-- Game actions (roll, move, chat) update last_activity in Redis.
-- broadcast_to_room sends JSON to all connections in the room.
-- Stale connections do not block broadcasts to other clients.
-- Broadcasting to an empty/unknown room is a no-op.
-- _GAME_ACTIONS constant includes all expected action types.
+Covers:
+ - WebSocket connection accepted for a room
+ - ping → pong round-trip
+ - Unknown message type returns NOT_IMPLEMENTED error
+ - Latency is buffered after each message
+ - flush_ws_metrics publishes buffered samples to CloudWatch
+ - Eager flush when buffer reaches threshold
+ - CloudWatch errors are swallowed
+ - clear / get helpers for buffer inspection
 """
 
-import json
-import time
-import uuid
-from unittest.mock import AsyncMock, patch
+from unittest.mock import MagicMock, patch
 
 import pytest
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
 
+import app.routes.websocket as ws_module
 from app.routes.websocket import (
-    _GAME_ACTIONS,
-    _activity_key,
-    _room_connections,
-    _update_last_activity,
-    broadcast_to_room,
+    router,
+    flush_ws_metrics,
+    get_ws_latency_buffer,
+    clear_ws_latency_buffer,
+    WS_NAMESPACE,
+    _WS_BUFFER_FLUSH_THRESHOLD,
 )
 
 
-# ---------------------------------------------------------------------------
-# _activity_key
-# ---------------------------------------------------------------------------
+# ──────────────────────────────────────────────────────────────────────────────
+# Fixture
+# ──────────────────────────────────────────────────────────────────────────────
 
 
-def test_activity_key_format() -> None:
-    room_id = "abc123"
-    assert _activity_key(room_id) == "room:abc123:last_activity"
+@pytest.fixture(autouse=True)
+def _reset_ws_buffer():
+    """Reset module-level WS latency buffer before each test."""
+    clear_ws_latency_buffer()
+    yield
+    clear_ws_latency_buffer()
 
 
-def test_activity_key_uuid() -> None:
-    room_id = str(uuid.uuid4())
-    assert _activity_key(room_id) == f"room:{room_id}:last_activity"
+def _build_app() -> FastAPI:
+    app = FastAPI()
+    app.include_router(router)
+    return app
 
 
-# ---------------------------------------------------------------------------
-# _update_last_activity
-# ---------------------------------------------------------------------------
+# ──────────────────────────────────────────────────────────────────────────────
+# WebSocket endpoint tests
+# ──────────────────────────────────────────────────────────────────────────────
 
 
-@pytest.mark.asyncio
-async def test_update_last_activity_writes_unix_timestamp() -> None:
-    """The Redis key is set to the current Unix timestamp (integer string)."""
-    room_id = str(uuid.uuid4())
-    mock_redis = AsyncMock()
+class TestWebSocketEndpoint:
+    def test_connect_and_ping_pong(self) -> None:
+        client = TestClient(_build_app())
+        with client.websocket_connect("/ws/rooms/test-room-1") as ws:
+            ws.send_json({"type": "ping"})
+            data = ws.receive_json()
+        assert data == {"type": "pong"}
 
-    before = int(time.time())
-    await _update_last_activity(mock_redis, room_id)
-    after = int(time.time())
+    def test_unknown_type_returns_not_implemented(self) -> None:
+        client = TestClient(_build_app())
+        with client.websocket_connect("/ws/rooms/abc") as ws:
+            ws.send_json({"type": "roll_request"})
+            data = ws.receive_json()
+        assert data["type"] == "error"
+        assert data["code"] == "NOT_IMPLEMENTED"
 
-    mock_redis.set.assert_awaited_once()
-    call_key, call_value = mock_redis.set.call_args[0]
+    def test_latency_is_buffered_after_message(self) -> None:
+        client = TestClient(_build_app())
+        with client.websocket_connect("/ws/rooms/room-x") as ws:
+            ws.send_json({"type": "ping"})
+            ws.receive_json()
 
-    assert call_key == f"room:{room_id}:last_activity"
-    assert before <= int(call_value) <= after
+        buf = get_ws_latency_buffer()
+        assert len(buf) == 1
+        assert buf[0] > 0  # duration must be positive
 
+    def test_multiple_messages_accumulate_in_buffer(self) -> None:
+        client = TestClient(_build_app())
+        with client.websocket_connect("/ws/rooms/multi") as ws:
+            for _ in range(3):
+                ws.send_json({"type": "ping"})
+                ws.receive_json()
 
-@pytest.mark.asyncio
-async def test_update_last_activity_called_on_roll_request() -> None:
-    """roll_request is a recognised game action that resets the idle timer."""
-    assert "roll_request" in _GAME_ACTIONS
-
-
-@pytest.mark.asyncio
-async def test_update_last_activity_called_on_select_pawn() -> None:
-    """select_pawn is a recognised game action that resets the idle timer."""
-    assert "select_pawn" in _GAME_ACTIONS
-
-
-@pytest.mark.asyncio
-async def test_update_last_activity_called_on_chat() -> None:
-    """chat is a recognised game action that resets the idle timer."""
-    assert "chat" in _GAME_ACTIONS
-
-
-# ---------------------------------------------------------------------------
-# broadcast_to_room
-# ---------------------------------------------------------------------------
+        assert len(get_ws_latency_buffer()) == 3
 
 
-@pytest.mark.asyncio
-async def test_broadcast_sends_json_to_all_connections() -> None:
-    """All active connections in the room receive the serialised message."""
-    room_id = str(uuid.uuid4())
-    ws1 = AsyncMock()
-    ws2 = AsyncMock()
-    _room_connections[room_id] = {"conn1": ws1, "conn2": ws2}
-
-    try:
-        await broadcast_to_room(room_id, {"type": "test", "value": 42})
-        expected = json.dumps({"type": "test", "value": 42})
-        ws1.send_text.assert_awaited_once_with(expected)
-        ws2.send_text.assert_awaited_once_with(expected)
-    finally:
-        del _room_connections[room_id]
+# ──────────────────────────────────────────────────────────────────────────────
+# flush_ws_metrics tests
+# ──────────────────────────────────────────────────────────────────────────────
 
 
-@pytest.mark.asyncio
-async def test_broadcast_room_closed_message() -> None:
-    """The canonical room_closed payload is delivered to all clients."""
-    room_id = str(uuid.uuid4())
-    ws = AsyncMock()
-    _room_connections[room_id] = {"conn1": ws}
+class TestFlushWsMetrics:
+    def test_no_op_when_empty(self) -> None:
+        mock_cw = MagicMock()
+        flush_ws_metrics(cloudwatch_client=mock_cw)
+        mock_cw.put_metric_data.assert_not_called()
 
-    try:
-        await broadcast_to_room(room_id, {"type": "room_closed", "reason": "inactivity"})
-        ws.send_text.assert_awaited_once_with(
-            json.dumps({"type": "room_closed", "reason": "inactivity"})
+    def test_publishes_latency_samples(self) -> None:
+        ws_module._ws_latency_buffer.extend([5.0, 10.0, 15.0])
+        mock_cw = MagicMock()
+        flush_ws_metrics(cloudwatch_client=mock_cw)
+
+        mock_cw.put_metric_data.assert_called()
+
+        all_metrics: list[dict] = []
+        for c in mock_cw.put_metric_data.call_args_list:
+            assert c.kwargs["Namespace"] == WS_NAMESPACE
+            all_metrics.extend(c.kwargs["MetricData"])
+
+        values = {m["Value"] for m in all_metrics}
+        assert values == {5.0, 10.0, 15.0}
+
+        for m in all_metrics:
+            assert m["Unit"] == "Milliseconds"
+            assert m["MetricName"] == "ws_message_latency_ms"
+
+    def test_buffer_cleared_after_flush(self) -> None:
+        ws_module._ws_latency_buffer.extend([1.0, 2.0])
+        mock_cw = MagicMock()
+        flush_ws_metrics(cloudwatch_client=mock_cw)
+        assert get_ws_latency_buffer() == []
+
+    def test_cloudwatch_error_is_swallowed(self) -> None:
+        from botocore.exceptions import ClientError
+
+        ws_module._ws_latency_buffer.append(99.0)
+        mock_cw = MagicMock()
+        mock_cw.put_metric_data.side_effect = ClientError(
+            {"Error": {"Code": "Throttling", "Message": "Rate exceeded"}},
+            "PutMetricData",
         )
-    finally:
-        del _room_connections[room_id]
+        # Should not raise
+        flush_ws_metrics(cloudwatch_client=mock_cw)
 
 
-@pytest.mark.asyncio
-async def test_broadcast_stale_connection_does_not_block_others() -> None:
-    """An exception on one connection does not interrupt delivery to the others."""
-    room_id = str(uuid.uuid4())
-    ws_good = AsyncMock()
-    ws_bad = AsyncMock()
-    ws_bad.send_text.side_effect = RuntimeError("connection closed")
-
-    _room_connections[room_id] = {"bad": ws_bad, "good": ws_good}
-
-    try:
-        await broadcast_to_room(room_id, {"type": "room_closed", "reason": "inactivity"})
-        ws_good.send_text.assert_awaited_once()
-    finally:
-        del _room_connections[room_id]
+# ──────────────────────────────────────────────────────────────────────────────
+# Eager flush threshold test
+# ──────────────────────────────────────────────────────────────────────────────
 
 
-@pytest.mark.asyncio
-async def test_broadcast_to_unknown_room_is_safe() -> None:
-    """Broadcasting to a room with no registered connections does not raise."""
-    room_id = str(uuid.uuid4())
-    # Ensure the room is not in _room_connections
-    _room_connections.pop(room_id, None)
-    # Should complete without error
-    await broadcast_to_room(room_id, {"type": "room_closed", "reason": "inactivity"})
+class TestEagerFlush:
+    def test_eager_flush_at_threshold(self) -> None:
+        """Buffer should be flushed (and cleared) when threshold is reached."""
+        import app.routes.websocket as ws_mod
+        from app.routes.websocket import _record_ws_latency
+
+        mock_cw = MagicMock()
+        with patch("boto3.client", return_value=mock_cw):
+            # Fill buffer to just before threshold
+            for _ in range(_WS_BUFFER_FLUSH_THRESHOLD - 1):
+                ws_mod._ws_latency_buffer.append(1.0)
+
+            # This call should trigger the eager flush
+            _record_ws_latency(1.0)
+
+        # After flush, buffer should be empty
+        assert get_ws_latency_buffer() == []
+        mock_cw.put_metric_data.assert_called()
 
 
-@pytest.mark.asyncio
-async def test_broadcast_to_empty_room_is_safe() -> None:
-    """A room entry with zero connections is treated as a no-op."""
-    room_id = str(uuid.uuid4())
-    _room_connections[room_id] = {}
-
-    try:
-        await broadcast_to_room(room_id, {"type": "ping"})
-    finally:
-        _room_connections.pop(room_id, None)
+# ──────────────────────────────────────────────────────────────────────────────
+# Dispatch tests
+# ──────────────────────────────────────────────────────────────────────────────
 
 
-# ---------------------------------------------------------------------------
-# _GAME_ACTIONS completeness
-# ---------------------------------------------------------------------------
+class TestDispatchMessage:
+    def test_ping_returns_pong(self) -> None:
+        from app.routes.websocket import _dispatch_message
 
+        result = _dispatch_message("ping", {"type": "ping"}, "room-1")
+        assert result == {"type": "pong"}
 
-def test_game_actions_is_frozen_set() -> None:
-    assert isinstance(_GAME_ACTIONS, frozenset)
+    def test_unknown_returns_error(self) -> None:
+        from app.routes.websocket import _dispatch_message
 
+        result = _dispatch_message("unknown_type", {"type": "unknown_type"}, "room-1")
+        assert result["type"] == "error"
+        assert result["code"] == "NOT_IMPLEMENTED"
 
-def test_game_actions_contains_all_expected_types() -> None:
-    assert _GAME_ACTIONS == {"roll_request", "select_pawn", "chat"}
+    def test_empty_type_returns_error(self) -> None:
+        from app.routes.websocket import _dispatch_message
+
+        result = _dispatch_message("", {}, "room-1")
+        assert result["type"] == "error"

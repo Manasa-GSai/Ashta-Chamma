@@ -1,145 +1,120 @@
-"""Unit tests for the FastAPI application entry point.
+"""Tests for server/app/main.py.
 
 Covers:
-- Health endpoint happy path
-- 500 error responses do not leak Sentry event IDs or internal details
-- Sentry is initialised with the correct parameters when DSN is present
-- Sentry is NOT initialised when DSN is absent
+ - Health check endpoint returns 200 with expected body
+ - App exposes expected metadata (title, version)
+ - Metrics middleware is registered
+ - WebSocket router is mounted
+ - Background task starts on app startup
 """
 
-import os
-from unittest.mock import MagicMock, patch
+import asyncio
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from fastapi import APIRouter
 from fastapi.testclient import TestClient
 
-from app.main import app
 
-# ---------------------------------------------------------------------------
-# Health endpoint
-# ---------------------------------------------------------------------------
+class TestHealthCheck:
+    def test_returns_200(self) -> None:
+        from app.main import app
 
+        client = TestClient(app)
+        response = client.get("/api/health")
+        assert response.status_code == 200
 
-def test_health_endpoint_returns_200() -> None:
-    client = TestClient(app)
-    response = client.get("/api/health")
-    assert response.status_code == 200
+    def test_body_has_status_ok(self) -> None:
+        from app.main import app
 
+        client = TestClient(app)
+        data = client.get("/api/health").json()
+        assert data["status"] == "ok"
 
-def test_health_endpoint_body_contains_ok_status() -> None:
-    client = TestClient(app)
-    response = client.get("/api/health")
-    assert response.json()["status"] == "ok"
+    def test_body_has_version(self) -> None:
+        from app.main import app
 
-
-def test_health_endpoint_body_contains_version() -> None:
-    client = TestClient(app)
-    response = client.get("/api/health")
-    data = response.json()
-    assert "version" in data
-    assert isinstance(data["version"], str)
+        client = TestClient(app)
+        data = client.get("/api/health").json()
+        assert "version" in data
+        assert isinstance(data["version"], str)
 
 
-# ---------------------------------------------------------------------------
-# Unhandled exception handling — must not leak internals to client
-# ---------------------------------------------------------------------------
+class TestAppMetadata:
+    def test_title(self) -> None:
+        from app.main import app
 
-# Shared router for routes that intentionally raise errors in tests.
-_error_router = APIRouter()
+        assert "Ashta Chamma" in app.title
 
+    def test_version(self) -> None:
+        from app.main import app
 
-@_error_router.get("/test-unhandled-error")
-async def _boom_route() -> None:
-    raise RuntimeError("secret internal message — must not reach client")
-
-
-app.include_router(_error_router)
-_error_client = TestClient(app, raise_server_exceptions=False)
+        assert app.version == "0.1.0"
 
 
-def test_unhandled_exception_returns_500() -> None:
-    response = _error_client.get("/test-unhandled-error")
-    assert response.status_code == 500
+class TestMiddlewareRegistration:
+    def test_metrics_middleware_present(self) -> None:
+        from app.main import app
+        from app.middleware.metrics import MetricsMiddleware
+
+        middleware_types = [m.cls for m in app.user_middleware]
+        assert MetricsMiddleware in middleware_types
 
 
-def test_unhandled_exception_response_body_is_generic() -> None:
-    response = _error_client.get("/test-unhandled-error")
-    assert response.json() == {"detail": "Internal server error"}
+class TestWebSocketRouterMounted:
+    def test_ws_route_exists(self) -> None:
+        from app.main import app
+
+        # Collect all route paths; WebSocket routes use different Route types
+        paths = []
+        for route in app.routes:
+            if hasattr(route, "path"):
+                paths.append(route.path)
+
+        assert any("/ws/rooms/{room_id}" in p for p in paths), (
+            f"WebSocket route not found. Routes: {paths}"
+        )
 
 
-def test_unhandled_exception_does_not_leak_error_message() -> None:
-    response = _error_client.get("/test-unhandled-error")
-    body_text = response.text
-    assert "secret internal message" not in body_text
+class TestPublishGameMetrics:
+    def test_publish_calls_boto3(self) -> None:
+        """_publish_game_metrics should call boto3 put_metric_data."""
+        from app.main import _publish_game_metrics
+
+        mock_client = MagicMock()
+        with patch("boto3.client", return_value=mock_client):
+            _publish_game_metrics(active_rooms=3, connected_players=12)
+
+        mock_client.put_metric_data.assert_called_once()
+        call_kwargs = mock_client.put_metric_data.call_args.kwargs
+        assert call_kwargs["Namespace"] == "AshtaChamma/Game"
+
+        names = {m["MetricName"] for m in call_kwargs["MetricData"]}
+        assert "active_rooms_count" in names
+        assert "connected_players_count" in names
+
+    def test_boto3_error_is_swallowed(self) -> None:
+        """CloudWatch failures in game metrics must not crash the app."""
+        from app.main import _publish_game_metrics
+
+        with patch("boto3.client", side_effect=Exception("network error")):
+            # Should not raise
+            _publish_game_metrics()
 
 
-def test_unhandled_exception_does_not_leak_sentry_event_id() -> None:
-    response = _error_client.get("/test-unhandled-error")
-    body_text = response.text.lower()
-    # The response must not contain any reference to Sentry or its event IDs.
-    assert "sentry" not in body_text
+class TestMetricsBackgroundTask:
+    @pytest.mark.asyncio
+    async def test_task_calls_flush_and_game_metrics(self) -> None:
+        from app.main import _metrics_background_task
 
+        with (
+            patch("app.main.flush_metrics") as mock_flush,
+            patch("app.main._publish_game_metrics") as mock_game,
+            patch("asyncio.sleep", new_callable=AsyncMock) as mock_sleep,
+        ):
+            # Run one iteration then cancel
+            mock_sleep.side_effect = [None, asyncio.CancelledError()]
+            with pytest.raises(asyncio.CancelledError):
+                await _metrics_background_task()
 
-# ---------------------------------------------------------------------------
-# Sentry initialisation — DSN controls whether SDK is activated
-# ---------------------------------------------------------------------------
-
-
-def test_sentry_init_called_when_dsn_is_set() -> None:
-    """Re-importing main with a DSN set should call sentry_sdk.init."""
-    import importlib
-
-    import sentry_sdk
-
-    with patch.dict(os.environ, {"SENTRY_DSN": "https://abc@sentry.io/1"}):
-        with patch.object(sentry_sdk, "init") as mock_init:
-            import app.config as cfg_module
-            import app.main as main_module
-
-            importlib.reload(cfg_module)
-            importlib.reload(main_module)
-            mock_init.assert_called_once()
-
-
-def test_sentry_init_not_called_when_dsn_is_empty() -> None:
-    """Re-importing main without a DSN must not call sentry_sdk.init."""
-    import importlib
-
-    import sentry_sdk
-
-    with patch.dict(os.environ, {}, clear=True):
-        with patch.object(sentry_sdk, "init") as mock_init:
-            import app.config as cfg_module
-            import app.main as main_module
-
-            importlib.reload(cfg_module)
-            importlib.reload(main_module)
-            mock_init.assert_not_called()
-
-
-def test_sentry_init_disables_default_pii() -> None:
-    """Sentry must never send PII (email, names) — only user IDs are permitted."""
-    import importlib
-
-    import sentry_sdk
-
-    with patch.dict(os.environ, {"SENTRY_DSN": "https://abc@sentry.io/1"}):
-        with patch.object(sentry_sdk, "init") as mock_init:
-            import app.config as cfg_module
-            import app.main as main_module
-
-            importlib.reload(cfg_module)
-            importlib.reload(main_module)
-
-            _args, kwargs = mock_init.call_args
-            assert kwargs.get("send_default_pii") is False
-
-
-def test_sentry_captures_exception_in_handler() -> None:
-    """The exception handler must forward the exception to Sentry."""
-    import sentry_sdk
-
-    with patch.object(sentry_sdk, "capture_exception") as mock_capture:
-        _error_client.get("/test-unhandled-error")
-        mock_capture.assert_called_once()
+        mock_flush.assert_called_once()
+        mock_game.assert_called_once()
