@@ -1,1 +1,1 @@
-"""Ashta Chamma game logic — board constants and state machine."""
+"""Game logic package — state machine, AI engine, move validation."""

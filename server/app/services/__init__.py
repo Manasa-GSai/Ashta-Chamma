@@ -1,1 +1,1 @@
-"""Service layer package — business logic and persistence operations."""
+"""Service layer — coordinates domain logic and external integrations."""
