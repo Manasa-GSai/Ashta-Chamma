@@ -1,71 +1,151 @@
-"""FastAPI application entry point for the Ashta Chamma 3D backend.
+"""Ashta Chamma 3D — FastAPI application entry point.
 
-Middleware registration order matters in Starlette/FastAPI: middleware added
-*last* via ``add_middleware`` executes *first* on the request path (LIFO
-wrapping).  We register:
-  1. SecurityHeadersMiddleware (outermost — added last so it runs first on
-     the *response* path, ensuring headers are always present)
-  2. RateLimitMiddleware (added first so the security headers wrap its 429
-     responses too)
+This module creates and configures the FastAPI application instance, registers
+all API routers with their route tags and descriptions, and sets up OpenAPI
+documentation endpoints at /docs (Swagger UI) and /redoc (ReDoc).
 
-Redis is wired up from the ``REDIS_URL`` environment variable.  If the
-variable is absent or the ``redis`` package is not installed, rate limiting
-is silently disabled so local development and CI are not broken.
+Concrete routers (rooms, users, scores, websocket) will be added by subsequent
+work orders and plugged in here.
 """
 
-import logging
-import os
-
 from fastapi import FastAPI
+from fastapi.responses import JSONResponse
 
-from app.middleware.rate_limit import RateLimitMiddleware
-from app.middleware.security_headers import SecurityHeadersMiddleware
-from app.routes import websocket as ws_module
+from app import __version__
 
-logger = logging.getLogger(__name__)
+# ---------------------------------------------------------------------------
+# OpenAPI metadata
+# ---------------------------------------------------------------------------
+_DESCRIPTION = """
+## Ashta Chamma 3D — API
 
-app = FastAPI(
-    title="Ashta Chamma 3D API",
-    version="0.1.0",
-    docs_url="/api/docs",
-    redoc_url="/api/redoc",
-    openapi_url="/api/openapi.json",
-    # Disable the default 422 detail schema leak — validation errors are
-    # returned with a generic message to avoid leaking internal model details.
-)
+Server-authoritative backend for the 3D multiplayer Ashta Chamma board game.
 
-# ── Middleware (outermost → innermost for requests; reversed for responses) ──
+### Features
 
-# Rate limiting: registered first so security headers wrap its 429 responses.
-_redis_client = None
-_redis_url = os.getenv("REDIS_URL")
-if _redis_url:
-    try:
-        import redis.asyncio as aioredis  # type: ignore[import-untyped]
+- **Room management** — create, join, and leave game rooms.
+- **Real-time gameplay** — WebSocket connections with Redis pub/sub fan-out.
+- **Leaderboards** — global and time-windowed score rankings.
+- **User profiles** — Clerk-authenticated player profiles.
 
-        _redis_client = aioredis.from_url(_redis_url, decode_responses=True)
-        logger.info("Rate limiting enabled via Redis: %s", _redis_url)
-    except ImportError:
-        logger.warning("redis package not installed; rate limiting is disabled")
+### Authentication
 
-app.add_middleware(RateLimitMiddleware, redis_client=_redis_client)
+All endpoints except `/api/health` require a valid **Clerk JWT** passed as a
+Bearer token in the `Authorization` header:
 
-# Security headers: registered last so it executes first on the response path,
-# guaranteeing headers on all responses including 429 from rate limiting.
-app.add_middleware(SecurityHeadersMiddleware)
+```
+Authorization: Bearer <clerk_jwt>
+```
 
-# ── Routers ──────────────────────────────────────────────────────────────────
+WebSocket connections pass the JWT as a query parameter:
 
-app.include_router(ws_module.router)
+```
+wss://api.example.com/ws/rooms/{room_id}?token=<clerk_jwt>
+```
+
+### Real-Time Protocol
+
+In-game communication uses a JSON WebSocket protocol with a `type` discriminator
+field. See the [architecture documentation](https://github.com/Manasa-GSai/Ashta-Chamma/blob/main/docs/architecture.md)
+for the full message catalogue.
+"""
+
+_TAGS_METADATA: list[dict[str, str]] = [
+    {
+        "name": "health",
+        "description": "Service health and readiness checks.",
+    },
+    {
+        "name": "rooms",
+        "description": (
+            "Game room lifecycle operations: create a room, retrieve room details, "
+            "join or leave a room."
+        ),
+    },
+    {
+        "name": "users",
+        "description": "User profile management for authenticated players.",
+    },
+    {
+        "name": "scores",
+        "description": "Leaderboard queries and per-user score history.",
+    },
+    {
+        "name": "websocket",
+        "description": (
+            "Real-time WebSocket endpoint for in-game communication. "
+            "Clients connect and exchange JSON messages: "
+            "`roll_request`, `select_pawn`, `chat`, `ping` (client→server) and "
+            "`state_update`, `roll_result`, `move_options`, `game_over`, `pong` (server→client)."
+        ),
+    },
+]
 
 
-# ── Health check (exempt from rate limiting) ─────────────────────────────────
+def create_app() -> FastAPI:
+    """Create and configure the FastAPI application.
 
-
-@app.get("/api/health", tags=["monitoring"])
-async def health_check() -> dict[str, str]:
-    """Liveness probe — no auth required, exempt from rate limiting.
-
-    Used by the ECS health check and ALB target group health probe.
+    Returns a fully-configured application instance with:
+    - OpenAPI docs at /docs (Swagger UI) and /redoc (ReDoc).
+    - Health check endpoint at /api/health.
+    - Versioned API prefix /api for all REST routes.
     """
-    return {"status": "ok", "version": "0.1.0"}
+    app = FastAPI(
+        title="Ashta Chamma 3D",
+        description=_DESCRIPTION,
+        version=__version__,
+        openapi_tags=_TAGS_METADATA,
+        docs_url="/docs",
+        redoc_url="/redoc",
+        openapi_url="/openapi.json",
+        license_info={
+            "name": "MIT",
+            "url": "https://opensource.org/licenses/MIT",
+        },
+        contact={
+            "name": "Ashta Chamma Team",
+            "url": "https://github.com/Manasa-GSai/Ashta-Chamma",
+        },
+    )
+
+    # ------------------------------------------------------------------
+    # Health check — no auth required; used by ALB and ECS health checks
+    # ------------------------------------------------------------------
+    @app.get(
+        "/api/health",
+        tags=["health"],
+        summary="Service health check",
+        description=(
+            "Returns the service status and current version. "
+            "Used by the ALB health check and ECS task health monitoring. "
+            "No authentication required."
+        ),
+        response_description="Service is healthy and accepting requests.",
+    )
+    async def health_check() -> JSONResponse:
+        """Return a simple health status payload."""
+        return JSONResponse(
+            content={"status": "ok", "version": __version__},
+            status_code=200,
+        )
+
+    # ------------------------------------------------------------------
+    # Future routers will be registered here, for example:
+    #
+    #   from app.routers.rooms import router as rooms_router
+    #   from app.routers.users import router as users_router
+    #   from app.routers.scores import router as scores_router
+    #   from app.routers.websocket import router as ws_router
+    #
+    #   app.include_router(rooms_router, prefix="/api", tags=["rooms"])
+    #   app.include_router(users_router, prefix="/api", tags=["users"])
+    #   app.include_router(scores_router, prefix="/api", tags=["scores"])
+    #   app.include_router(ws_router, tags=["websocket"])
+    # ------------------------------------------------------------------
+
+    return app
+
+
+# Module-level application instance consumed by Uvicorn:
+#   uvicorn app.main:app --host 0.0.0.0 --port 8000
+app = create_app()

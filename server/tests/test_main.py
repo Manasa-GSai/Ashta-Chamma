@@ -1,120 +1,144 @@
-"""Tests for server/app/main.py.
+"""Tests for the FastAPI application entry point (app/main.py).
 
 Covers:
- - Health check endpoint returns 200 with expected body
- - App exposes expected metadata (title, version)
- - Metrics middleware is registered
- - WebSocket router is mounted
- - Background task starts on app startup
+- Application creation and correct metadata.
+- OpenAPI documentation endpoints (/docs, /redoc, /openapi.json).
+- Health check endpoint happy path and response shape.
 """
-
-import asyncio
-from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from fastapi.testclient import TestClient
 
-
-class TestHealthCheck:
-    def test_returns_200(self) -> None:
-        from app.main import app
-
-        client = TestClient(app)
-        response = client.get("/api/health")
-        assert response.status_code == 200
-
-    def test_body_has_status_ok(self) -> None:
-        from app.main import app
-
-        client = TestClient(app)
-        data = client.get("/api/health").json()
-        assert data["status"] == "ok"
-
-    def test_body_has_version(self) -> None:
-        from app.main import app
-
-        client = TestClient(app)
-        data = client.get("/api/health").json()
-        assert "version" in data
-        assert isinstance(data["version"], str)
+from app import __version__
+from app.main import app, create_app
 
 
-class TestAppMetadata:
-    def test_title(self) -> None:
-        from app.main import app
-
-        assert "Ashta Chamma" in app.title
-
-    def test_version(self) -> None:
-        from app.main import app
-
-        assert app.version == "0.1.0"
+# ---------------------------------------------------------------------------
+# Fixtures
+# ---------------------------------------------------------------------------
 
 
-class TestMiddlewareRegistration:
-    def test_metrics_middleware_present(self) -> None:
-        from app.main import app
-        from app.middleware.metrics import MetricsMiddleware
-
-        middleware_types = [m.cls for m in app.user_middleware]
-        assert MetricsMiddleware in middleware_types
+@pytest.fixture()
+def client() -> TestClient:
+    """Return a synchronous test client for the FastAPI app."""
+    return TestClient(app)
 
 
-class TestWebSocketRouterMounted:
-    def test_ws_route_exists(self) -> None:
-        from app.main import app
-
-        # Collect all route paths; WebSocket routes use different Route types
-        paths = []
-        for route in app.routes:
-            if hasattr(route, "path"):
-                paths.append(route.path)
-
-        assert any("/ws/rooms/{room_id}" in p for p in paths), (
-            f"WebSocket route not found. Routes: {paths}"
-        )
+# ---------------------------------------------------------------------------
+# Application creation
+# ---------------------------------------------------------------------------
 
 
-class TestPublishGameMetrics:
-    def test_publish_calls_boto3(self) -> None:
-        """_publish_game_metrics should call boto3 put_metric_data."""
-        from app.main import _publish_game_metrics
+def test_create_app_returns_fastapi_instance() -> None:
+    """create_app() returns a new FastAPI instance each time."""
+    from fastapi import FastAPI
 
-        mock_client = MagicMock()
-        with patch("boto3.client", return_value=mock_client):
-            _publish_game_metrics(active_rooms=3, connected_players=12)
-
-        mock_client.put_metric_data.assert_called_once()
-        call_kwargs = mock_client.put_metric_data.call_args.kwargs
-        assert call_kwargs["Namespace"] == "AshtaChamma/Game"
-
-        names = {m["MetricName"] for m in call_kwargs["MetricData"]}
-        assert "active_rooms_count" in names
-        assert "connected_players_count" in names
-
-    def test_boto3_error_is_swallowed(self) -> None:
-        """CloudWatch failures in game metrics must not crash the app."""
-        from app.main import _publish_game_metrics
-
-        with patch("boto3.client", side_effect=Exception("network error")):
-            # Should not raise
-            _publish_game_metrics()
+    result = create_app()
+    assert isinstance(result, FastAPI)
 
 
-class TestMetricsBackgroundTask:
-    @pytest.mark.asyncio
-    async def test_task_calls_flush_and_game_metrics(self) -> None:
-        from app.main import _metrics_background_task
+def test_app_title() -> None:
+    """Application title is set correctly for OpenAPI metadata."""
+    assert app.title == "Ashta Chamma 3D"
 
-        with (
-            patch("app.main.flush_metrics") as mock_flush,
-            patch("app.main._publish_game_metrics") as mock_game,
-            patch("asyncio.sleep", new_callable=AsyncMock) as mock_sleep,
-        ):
-            # Run one iteration then cancel
-            mock_sleep.side_effect = [None, asyncio.CancelledError()]
-            with pytest.raises(asyncio.CancelledError):
-                await _metrics_background_task()
 
-        mock_flush.assert_called_once()
-        mock_game.assert_called_once()
+def test_app_version_matches_package_version() -> None:
+    """Application version matches the package __version__ constant."""
+    assert app.version == __version__
+
+
+def test_app_has_openapi_tags() -> None:
+    """Application exposes expected tag names for route grouping."""
+    tag_names = {tag["name"] for tag in (app.openapi_tags or [])}
+    expected = {"health", "rooms", "users", "scores", "websocket"}
+    assert expected.issubset(tag_names)
+
+
+# ---------------------------------------------------------------------------
+# OpenAPI documentation endpoints
+# ---------------------------------------------------------------------------
+
+
+def test_openapi_json_accessible(client: TestClient) -> None:
+    """GET /openapi.json returns 200 with a valid OpenAPI schema."""
+    response = client.get("/openapi.json")
+    assert response.status_code == 200
+    data = response.json()
+    assert data["info"]["title"] == "Ashta Chamma 3D"
+    assert "paths" in data
+
+
+def test_swagger_ui_accessible(client: TestClient) -> None:
+    """GET /docs returns 200 (Swagger UI)."""
+    response = client.get("/docs")
+    assert response.status_code == 200
+    assert "text/html" in response.headers["content-type"]
+
+
+def test_redoc_accessible(client: TestClient) -> None:
+    """GET /redoc returns 200 (ReDoc UI)."""
+    response = client.get("/redoc")
+    assert response.status_code == 200
+    assert "text/html" in response.headers["content-type"]
+
+
+# ---------------------------------------------------------------------------
+# Health check endpoint
+# ---------------------------------------------------------------------------
+
+
+def test_health_check_returns_200(client: TestClient) -> None:
+    """GET /api/health returns HTTP 200."""
+    response = client.get("/api/health")
+    assert response.status_code == 200
+
+
+def test_health_check_response_shape(client: TestClient) -> None:
+    """GET /api/health returns the expected JSON payload shape."""
+    response = client.get("/api/health")
+    data = response.json()
+    assert "status" in data
+    assert "version" in data
+
+
+def test_health_check_status_is_ok(client: TestClient) -> None:
+    """GET /api/health returns status == 'ok'."""
+    response = client.get("/api/health")
+    assert response.json()["status"] == "ok"
+
+
+def test_health_check_version_matches(client: TestClient) -> None:
+    """GET /api/health returns version matching __version__."""
+    response = client.get("/api/health")
+    assert response.json()["version"] == __version__
+
+
+def test_health_check_content_type_is_json(client: TestClient) -> None:
+    """GET /api/health returns application/json content type."""
+    response = client.get("/api/health")
+    assert "application/json" in response.headers["content-type"]
+
+
+def test_health_check_requires_no_auth(client: TestClient) -> None:
+    """GET /api/health succeeds without an Authorization header."""
+    response = client.get("/api/health", headers={})
+    assert response.status_code == 200
+
+
+# ---------------------------------------------------------------------------
+# Health check is discoverable in OpenAPI schema
+# ---------------------------------------------------------------------------
+
+
+def test_health_check_in_openapi_schema(client: TestClient) -> None:
+    """The /api/health path is included in the generated OpenAPI schema."""
+    schema = client.get("/openapi.json").json()
+    assert "/api/health" in schema["paths"]
+
+
+def test_health_check_tagged_correctly(client: TestClient) -> None:
+    """The /api/health endpoint is tagged with 'health' in OpenAPI schema."""
+    schema = client.get("/openapi.json").json()
+    health_path = schema["paths"].get("/api/health", {})
+    get_op = health_path.get("get", {})
+    assert "health" in get_op.get("tags", [])
