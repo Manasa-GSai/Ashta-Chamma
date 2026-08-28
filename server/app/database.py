@@ -1,8 +1,10 @@
-"""Database engine and session factory for async SQLAlchemy access.
+"""Database engine and async session factory.
 
-The session is provided to route handlers via the ``get_db`` FastAPI
-dependency.  Each request receives its own ``AsyncSession`` that is closed
-after the response is sent.
+Reads DATABASE_URL from the environment (required in staging/production).
+Defaults to a local development connection string for convenience.
+
+Requires ``asyncpg`` at runtime (add to pyproject.toml dependencies):
+    asyncpg = "^0.30.0"
 """
 
 import os
@@ -10,21 +12,23 @@ from collections.abc import AsyncGenerator
 
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
-_DATABASE_URL: str = os.environ.get(
+DATABASE_URL: str = os.getenv(
     "DATABASE_URL",
     "postgresql+asyncpg://postgres:postgres@localhost:5432/ashta_chamma",
 )
 
-engine = create_async_engine(_DATABASE_URL, echo=False, future=True)
+engine = create_async_engine(DATABASE_URL, echo=False, pool_pre_ping=True)
 
-_async_session_factory: async_sessionmaker[AsyncSession] = async_sessionmaker(
-    engine,
-    expire_on_commit=False,
+AsyncSessionLocal = async_sessionmaker(
+    bind=engine,
     class_=AsyncSession,
+    expire_on_commit=False,
+    autocommit=False,
+    autoflush=False,
 )
 
 
 async def get_db() -> AsyncGenerator[AsyncSession, None]:
-    """FastAPI dependency that yields a database session per request."""
-    async with _async_session_factory() as session:
+    """FastAPI dependency — yield a database session, closing it after use."""
+    async with AsyncSessionLocal() as session:
         yield session

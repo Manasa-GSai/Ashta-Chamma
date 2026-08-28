@@ -1,1 +1,1 @@
-"""Service modules for the Ashta Chamma FastAPI backend."""
+"""Service layer package — business logic and persistence operations."""

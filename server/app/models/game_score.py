@@ -1,48 +1,39 @@
-"""GameScore ORM model — maps to the `game_scores` table in PostgreSQL."""
+"""SQLAlchemy ORM model for the game_scores table.
 
-import uuid
-from datetime import datetime
+Each row records a single player's outcome from one completed game.
+Both human (user_id set) and AI (ai_persona_id set) players are stored.
+The compound index on (user_id, scored_at DESC) supports efficient
+leaderboard and history queries.
+"""
 
-from sqlalchemy import DateTime, ForeignKey, Integer, func
-from sqlalchemy.dialects.postgresql import UUID
+import datetime
+
+from sqlalchemy import DateTime, Index, Integer, String, func
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.models.base import Base
 
 
 class GameScore(Base):
-    """Per-game result record.
-
-    ``user_id`` is nullable so that a user erasure request can de-link the
-    score from the deleted account while preserving the aggregate statistics
-    row for leaderboard and analytics purposes (GDPR recital 26).
-    """
+    """Per-player, per-game result row."""
 
     __tablename__ = "game_scores"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    room_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True),
-        ForeignKey("rooms.id"),
-        nullable=False,
-    )
-    # Nullable — set to NULL on user erasure to de-link PII while retaining stats.
-    user_id: Mapped[uuid.UUID | None] = mapped_column(
-        UUID(as_uuid=True),
-        ForeignKey("users.id"),
-        nullable=True,
-    )
-    ai_persona_id: Mapped[int | None] = mapped_column(
-        Integer,
-        ForeignKey("ai_personas.id"),
-        nullable=True,
-    )
+    room_id: Mapped[str] = mapped_column(String(36), nullable=False)
+    # Exactly one of user_id / ai_persona_id is set; the other is NULL.
+    user_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    ai_persona_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
     finish_position: Mapped[int] = mapped_column(Integer, nullable=False)
-    pawns_captured: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
-    pawns_lost: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
-    duration_seconds: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
-    scored_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True),
-        server_default=func.now(),
-        nullable=False,
+    pawns_captured: Mapped[int] = mapped_column(Integer, nullable=False)
+    pawns_lost: Mapped[int] = mapped_column(Integer, nullable=False)
+    duration_seconds: Mapped[int] = mapped_column(Integer, nullable=False)
+    scored_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    __table_args__ = (
+        # Supports per-user history (ORDER BY scored_at DESC) and leaderboard
+        # period filtering efficiently.
+        Index("ix_game_scores_user_id_scored_at", "user_id", "scored_at"),
     )

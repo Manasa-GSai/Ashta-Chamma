@@ -1,9 +1,13 @@
-"""FastAPI dependencies shared across route modules.
+"""FastAPI dependency providers for authentication and common resources.
 
-``get_current_clerk_id`` extracts the Clerk user ID from the JWT ``sub``
-claim.  Full RS256 signature verification against Clerk's JWKS endpoint is
-an infrastructure concern deferred to a dedicated middleware once the
-``CLERK_JWKS_URL`` environment variable is configured.
+The ``get_current_user_id`` dependency extracts the authenticated user's
+ID from the Clerk-issued JWT. Full signature verification (JWKS lookup,
+expiry validation) is implemented in WO-008. This module provides the
+dependency interface so that route handlers and tests can use a stable
+contract without coupling to Clerk SDK details.
+
+Tests override this dependency via ``app.dependency_overrides`` to inject
+a known user_id without a real JWT.
 """
 
 import base64
@@ -15,53 +19,44 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 logger = logging.getLogger(__name__)
 
-_bearer_scheme = HTTPBearer()
+_bearer_scheme = HTTPBearer(auto_error=True)
 
 
-def _decode_jwt_payload(token: str) -> dict[str, object]:
-    """Decode the payload segment of a JWT without verifying the signature.
-
-    JWT segments are Base64URL-encoded without padding.  This function adds
-    the required padding back before decoding.
-
-    Raises:
-        ValueError: if the token is malformed or the payload is not valid JSON.
-    """
-    parts = token.split(".")
-    if len(parts) != 3:  # noqa: PLR2004
-        raise ValueError(f"Malformed JWT: expected 3 dot-separated segments, got {len(parts)}")
-
-    # Base64URL encoding omits ``=`` padding — restore it before decoding.
-    padded = parts[1] + "=" * (4 - len(parts[1]) % 4)
-    try:
-        payload_bytes = base64.urlsafe_b64decode(padded)
-        return json.loads(payload_bytes)  # type: ignore[return-value]
-    except Exception as exc:
-        raise ValueError(f"Unable to decode JWT payload: {exc}") from exc
-
-
-async def get_current_clerk_id(
+async def get_current_user_id(
     credentials: HTTPAuthorizationCredentials = Depends(_bearer_scheme),
 ) -> str:
-    """FastAPI dependency — returns the Clerk user ID from the Bearer JWT.
+    """Extract the Clerk user ID (``sub`` claim) from a Bearer JWT.
+
+    This is a **stub** implementation: it decodes the payload without
+    verifying the signature so that routes can be exercised without a live
+    Clerk environment. WO-008 replaces the decode logic with a full JWKS
+    verification.
 
     Raises:
-        HTTPException(401): if the token is missing, malformed, or has no
+        HTTPException 401: If the token is missing, malformed, or has no
             ``sub`` claim.
     """
+    token = credentials.credentials
     try:
-        payload = _decode_jwt_payload(credentials.credentials)
-    except ValueError as exc:
+        # JWT structure: <header_b64>.<payload_b64>.<signature_b64>
+        parts = token.split(".")
+        if len(parts) != 3:
+            raise ValueError("Not a three-part JWT")
+
+        payload_b64 = parts[1]
+        # Restore standard base64 padding.
+        padding_needed = (4 - len(payload_b64) % 4) % 4
+        payload_b64 += "=" * padding_needed
+
+        payload = json.loads(base64.urlsafe_b64decode(payload_b64))
+        user_id: str | None = payload.get("sub")
+        if not user_id:
+            raise ValueError("JWT payload missing 'sub' claim")
+        return user_id
+    except Exception as exc:
         logger.debug("JWT decode failed: %s", exc)
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid authentication token",
+            detail="Invalid or missing authentication credentials",
+            headers={"WWW-Authenticate": "Bearer"},
         ) from exc
-
-    sub = payload.get("sub")
-    if not isinstance(sub, str) or not sub:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Token is missing the required 'sub' claim",
-        )
-    return sub

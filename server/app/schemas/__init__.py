@@ -1,1 +1,1 @@
-"""Pydantic schema modules for request/response validation."""
+"""Pydantic schema package for request/response models."""
