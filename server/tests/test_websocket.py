@@ -1,188 +1,144 @@
-"""Tests for server/app/routes/websocket.py.
+"""Tests for the WebSocket route handler.
 
 Covers:
- - WebSocket connection accepted for a room
- - ping → pong round-trip
- - Unknown message type returns NOT_IMPLEMENTED error
- - Latency is buffered after each message
- - flush_ws_metrics publishes buffered samples to CloudWatch
- - Eager flush when buffer reaches threshold
- - CloudWatch errors are swallowed
- - clear / get helpers for buffer inspection
+- Valid messages are accepted and handled (ping → pong).
+- Invalid messages return {type: 'error', message: 'Invalid message format'}.
+- Per-connection rate limiting: 11th message in 1 second receives an error frame.
+- Room ID is used in the endpoint URL (path parameter routing works).
 """
 
-from unittest.mock import MagicMock, patch
+import json
+import time
 
 import pytest
-from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-import app.routes.websocket as ws_module
-from app.routes.websocket import (
-    router,
-    flush_ws_metrics,
-    get_ws_latency_buffer,
-    clear_ws_latency_buffer,
-    WS_NAMESPACE,
-    _WS_BUFFER_FLUSH_THRESHOLD,
-)
+from app.main import app
+
+_client = TestClient(app)
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Fixture
-# ──────────────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# Ping / pong
+# ---------------------------------------------------------------------------
 
 
-@pytest.fixture(autouse=True)
-def _reset_ws_buffer():
-    """Reset module-level WS latency buffer before each test."""
-    clear_ws_latency_buffer()
-    yield
-    clear_ws_latency_buffer()
+def test_ping_returns_pong() -> None:
+    with _client.websocket_connect("/ws/rooms/test-room-1") as ws:
+        ws.send_text(json.dumps({"type": "ping"}))
+        data = json.loads(ws.receive_text())
+        assert data["type"] == "pong"
 
 
-def _build_app() -> FastAPI:
-    app = FastAPI()
-    app.include_router(router)
-    return app
+# ---------------------------------------------------------------------------
+# Invalid message schema
+# ---------------------------------------------------------------------------
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# WebSocket endpoint tests
-# ──────────────────────────────────────────────────────────────────────────────
-
-
-class TestWebSocketEndpoint:
-    def test_connect_and_ping_pong(self) -> None:
-        client = TestClient(_build_app())
-        with client.websocket_connect("/ws/rooms/test-room-1") as ws:
-            ws.send_json({"type": "ping"})
-            data = ws.receive_json()
-        assert data == {"type": "pong"}
-
-    def test_unknown_type_returns_not_implemented(self) -> None:
-        client = TestClient(_build_app())
-        with client.websocket_connect("/ws/rooms/abc") as ws:
-            ws.send_json({"type": "roll_request"})
-            data = ws.receive_json()
+def test_invalid_json_returns_error_frame() -> None:
+    with _client.websocket_connect("/ws/rooms/test-room-2") as ws:
+        ws.send_text("not-valid-json{{{")
+        data = json.loads(ws.receive_text())
         assert data["type"] == "error"
-        assert data["code"] == "NOT_IMPLEMENTED"
-
-    def test_latency_is_buffered_after_message(self) -> None:
-        client = TestClient(_build_app())
-        with client.websocket_connect("/ws/rooms/room-x") as ws:
-            ws.send_json({"type": "ping"})
-            ws.receive_json()
-
-        buf = get_ws_latency_buffer()
-        assert len(buf) == 1
-        assert buf[0] > 0  # duration must be positive
-
-    def test_multiple_messages_accumulate_in_buffer(self) -> None:
-        client = TestClient(_build_app())
-        with client.websocket_connect("/ws/rooms/multi") as ws:
-            for _ in range(3):
-                ws.send_json({"type": "ping"})
-                ws.receive_json()
-
-        assert len(get_ws_latency_buffer()) == 3
+        assert data["message"] == "Invalid message format"
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# flush_ws_metrics tests
-# ──────────────────────────────────────────────────────────────────────────────
+def test_unknown_message_type_returns_error_frame() -> None:
+    with _client.websocket_connect("/ws/rooms/test-room-3") as ws:
+        ws.send_text(json.dumps({"type": "unknown_command"}))
+        data = json.loads(ws.receive_text())
+        assert data["type"] == "error"
+        assert data["message"] == "Invalid message format"
 
 
-class TestFlushWsMetrics:
-    def test_no_op_when_empty(self) -> None:
-        mock_cw = MagicMock()
-        flush_ws_metrics(cloudwatch_client=mock_cw)
-        mock_cw.put_metric_data.assert_not_called()
-
-    def test_publishes_latency_samples(self) -> None:
-        ws_module._ws_latency_buffer.extend([5.0, 10.0, 15.0])
-        mock_cw = MagicMock()
-        flush_ws_metrics(cloudwatch_client=mock_cw)
-
-        mock_cw.put_metric_data.assert_called()
-
-        all_metrics: list[dict] = []
-        for c in mock_cw.put_metric_data.call_args_list:
-            assert c.kwargs["Namespace"] == WS_NAMESPACE
-            all_metrics.extend(c.kwargs["MetricData"])
-
-        values = {m["Value"] for m in all_metrics}
-        assert values == {5.0, 10.0, 15.0}
-
-        for m in all_metrics:
-            assert m["Unit"] == "Milliseconds"
-            assert m["MetricName"] == "ws_message_latency_ms"
-
-    def test_buffer_cleared_after_flush(self) -> None:
-        ws_module._ws_latency_buffer.extend([1.0, 2.0])
-        mock_cw = MagicMock()
-        flush_ws_metrics(cloudwatch_client=mock_cw)
-        assert get_ws_latency_buffer() == []
-
-    def test_cloudwatch_error_is_swallowed(self) -> None:
-        from botocore.exceptions import ClientError
-
-        ws_module._ws_latency_buffer.append(99.0)
-        mock_cw = MagicMock()
-        mock_cw.put_metric_data.side_effect = ClientError(
-            {"Error": {"Code": "Throttling", "Message": "Rate exceeded"}},
-            "PutMetricData",
-        )
-        # Should not raise
-        flush_ws_metrics(cloudwatch_client=mock_cw)
+def test_missing_required_field_returns_error_frame() -> None:
+    """select_pawn without pawn_id should return an error frame."""
+    with _client.websocket_connect("/ws/rooms/test-room-4") as ws:
+        ws.send_text(json.dumps({"type": "select_pawn"}))
+        data = json.loads(ws.receive_text())
+        assert data["type"] == "error"
+        assert data["message"] == "Invalid message format"
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Eager flush threshold test
-# ──────────────────────────────────────────────────────────────────────────────
+def test_strict_type_rejection_returns_error_frame() -> None:
+    """pawn_id passed as string should fail strict validation."""
+    with _client.websocket_connect("/ws/rooms/test-room-5") as ws:
+        ws.send_text(json.dumps({"type": "select_pawn", "pawn_id": "two"}))
+        data = json.loads(ws.receive_text())
+        assert data["type"] == "error"
+        assert data["message"] == "Invalid message format"
 
 
-class TestEagerFlush:
-    def test_eager_flush_at_threshold(self) -> None:
-        """Buffer should be flushed (and cleared) when threshold is reached."""
-        import app.routes.websocket as ws_mod
-        from app.routes.websocket import _record_ws_latency
-
-        mock_cw = MagicMock()
-        with patch("boto3.client", return_value=mock_cw):
-            # Fill buffer to just before threshold
-            for _ in range(_WS_BUFFER_FLUSH_THRESHOLD - 1):
-                ws_mod._ws_latency_buffer.append(1.0)
-
-            # This call should trigger the eager flush
-            _record_ws_latency(1.0)
-
-        # After flush, buffer should be empty
-        assert get_ws_latency_buffer() == []
-        mock_cw.put_metric_data.assert_called()
+# ---------------------------------------------------------------------------
+# WebSocket rate limiting
+# ---------------------------------------------------------------------------
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Dispatch tests
-# ──────────────────────────────────────────────────────────────────────────────
+def test_rate_limit_drops_excess_messages() -> None:
+    """Sending 11 pings in rapid succession should trigger a rate-limit error."""
+    from app.routes.websocket import _WS_RATE_LIMIT
+
+    with _client.websocket_connect("/ws/rooms/rate-limit-room") as ws:
+        responses = []
+        # Send _WS_RATE_LIMIT + 1 messages; the last one should be rate-limited.
+        for _ in range(_WS_RATE_LIMIT + 1):
+            ws.send_text(json.dumps({"type": "ping"}))
+
+        # Collect all responses
+        for _ in range(_WS_RATE_LIMIT + 1):
+            responses.append(json.loads(ws.receive_text()))
+
+        types = [r["type"] for r in responses]
+        # The excess message should trigger an error response
+        assert "error" in types
+        # At least some pongs should have succeeded
+        assert "pong" in types
 
 
-class TestDispatchMessage:
-    def test_ping_returns_pong(self) -> None:
-        from app.routes.websocket import _dispatch_message
+def test_rate_limit_error_message_content() -> None:
+    """The rate-limit error frame contains an informative message."""
+    from app.routes.websocket import _WS_RATE_LIMIT
 
-        result = _dispatch_message("ping", {"type": "ping"}, "room-1")
-        assert result == {"type": "pong"}
+    with _client.websocket_connect("/ws/rooms/rate-limit-msg-room") as ws:
+        for _ in range(_WS_RATE_LIMIT + 1):
+            ws.send_text(json.dumps({"type": "ping"}))
 
-    def test_unknown_returns_error(self) -> None:
-        from app.routes.websocket import _dispatch_message
+        error_found = False
+        for _ in range(_WS_RATE_LIMIT + 1):
+            data = json.loads(ws.receive_text())
+            if data["type"] == "error" and "rate limit" in data["message"].lower():
+                error_found = True
+                break
 
-        result = _dispatch_message("unknown_type", {"type": "unknown_type"}, "room-1")
-        assert result["type"] == "error"
-        assert result["code"] == "NOT_IMPLEMENTED"
+        assert error_found, "Expected a rate-limit error frame but did not receive one"
 
-    def test_empty_type_returns_error(self) -> None:
-        from app.routes.websocket import _dispatch_message
 
-        result = _dispatch_message("", {}, "room-1")
-        assert result["type"] == "error"
+# ---------------------------------------------------------------------------
+# Valid non-ping messages (no crash path)
+# ---------------------------------------------------------------------------
+
+
+def test_roll_request_accepted_without_crash() -> None:
+    """roll_request is a valid message and must not crash the handler."""
+    with _client.websocket_connect("/ws/rooms/roll-room") as ws:
+        ws.send_text(json.dumps({"type": "roll_request"}))
+        # No response expected yet (game logic stub); just verify no crash.
+        ws.send_text(json.dumps({"type": "ping"}))
+        data = json.loads(ws.receive_text())
+        assert data["type"] == "pong"
+
+
+def test_chat_message_accepted_without_crash() -> None:
+    with _client.websocket_connect("/ws/rooms/chat-room") as ws:
+        ws.send_text(json.dumps({"type": "chat", "text": "Hello, world!"}))
+        ws.send_text(json.dumps({"type": "ping"}))
+        data = json.loads(ws.receive_text())
+        assert data["type"] == "pong"
+
+
+def test_select_pawn_accepted_without_crash() -> None:
+    with _client.websocket_connect("/ws/rooms/select-room") as ws:
+        ws.send_text(json.dumps({"type": "select_pawn", "pawn_id": 0}))
+        ws.send_text(json.dumps({"type": "ping"}))
+        data = json.loads(ws.receive_text())
+        assert data["type"] == "pong"

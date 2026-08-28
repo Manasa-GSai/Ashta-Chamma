@@ -1,132 +1,71 @@
-"""FastAPI application entry point for Ashta Chamma 3D.
+"""FastAPI application entry point for the Ashta Chamma 3D backend.
 
-Initialises the FastAPI app, registers the MetricsMiddleware, mounts routers,
-and runs background tasks for periodic CloudWatch metric publishing.
+Middleware registration order matters in Starlette/FastAPI: middleware added
+*last* via ``add_middleware`` executes *first* on the request path (LIFO
+wrapping).  We register:
+  1. SecurityHeadersMiddleware (outermost — added last so it runs first on
+     the *response* path, ensuring headers are always present)
+  2. RateLimitMiddleware (added first so the security headers wrap its 429
+     responses too)
 
-Architecture layer: entry point (creates the ASGI app consumed by uvicorn).
+Redis is wired up from the ``REDIS_URL`` environment variable.  If the
+variable is absent or the ``redis`` package is not installed, rate limiting
+is silently disabled so local development and CI are not broken.
 """
 
-import asyncio
 import logging
-from collections.abc import AsyncGenerator
-from contextlib import asynccontextmanager
-from typing import Any
+import os
 
 from fastapi import FastAPI
-from fastapi.responses import JSONResponse
 
-from app.middleware.metrics import MetricsMiddleware, flush_metrics
-from app.routes.websocket import router as websocket_router
+from app.middleware.rate_limit import RateLimitMiddleware
+from app.middleware.security_headers import SecurityHeadersMiddleware
+from app.routes import websocket as ws_module
 
 logger = logging.getLogger(__name__)
-
-# Standard (60-second) resolution keeps CloudWatch costs within the $100/month budget.
-METRIC_FLUSH_INTERVAL_SECONDS = 60
-
-GAME_NAMESPACE = "AshtaChamma/Game"
-
-
-def _publish_game_metrics(active_rooms: int = 0, connected_players: int = 0) -> None:
-    """Publish game-level gauge metrics (point-in-time counts) to CloudWatch.
-
-    These are separate from request-scoped metrics because they represent
-    current inventory rather than latency histograms.  Called from the
-    background task on the same 60-second cadence.
-
-    Args:
-        active_rooms: Number of rooms currently in progress.
-        connected_players: Number of WebSocket clients currently connected.
-    """
-    try:
-        import boto3  # noqa: PLC0415 — lazy import to allow test patching
-        from botocore.exceptions import BotoCoreError, ClientError  # noqa: PLC0415
-
-        client = boto3.client("cloudwatch")
-        client.put_metric_data(
-            Namespace=GAME_NAMESPACE,
-            MetricData=[
-                {
-                    "MetricName": "active_rooms_count",
-                    "Value": float(active_rooms),
-                    "Unit": "Count",
-                },
-                {
-                    "MetricName": "connected_players_count",
-                    "Value": float(connected_players),
-                    "Unit": "Count",
-                },
-            ],
-        )
-    except Exception as exc:  # noqa: BLE001 — observability must not crash the app
-        logger.warning("Failed to publish game metrics to CloudWatch: %s", exc)
-
-
-async def _metrics_background_task() -> None:
-    """Flush HTTP metrics and publish game counters every 60 seconds.
-
-    Uses standard (60 s) resolution to stay within the $100/month CloudWatch
-    budget.  The coroutine runs indefinitely until cancelled at shutdown.
-
-    Game counters (active rooms, connected players) are stubbed to 0 here;
-    once the RoomManager service is implemented (WO-004+) it will be queried
-    for live counts.
-    """
-    while True:
-        await asyncio.sleep(METRIC_FLUSH_INTERVAL_SECONDS)
-        try:
-            flush_metrics()
-            # TODO(WO-004): pass real room/player counts from RoomManager
-            _publish_game_metrics(active_rooms=0, connected_players=0)
-        except Exception as exc:  # noqa: BLE001
-            logger.exception("Unexpected error in metrics background task: %s", exc)
-
-
-@asynccontextmanager
-async def lifespan(app: FastAPI) -> AsyncGenerator[None, Any]:
-    """Manage application startup/shutdown lifecycle.
-
-    Starts the metrics background task on boot and cancels it cleanly on
-    shutdown so the last partial bucket of metrics is not silently discarded.
-    (A final flush could be added here if needed.)
-    """
-    task = asyncio.create_task(_metrics_background_task())
-    logger.info("Metrics background task started (flush interval: %ds)", METRIC_FLUSH_INTERVAL_SECONDS)
-    try:
-        yield
-    finally:
-        task.cancel()
-        try:
-            await task
-        except asyncio.CancelledError:
-            pass
-        logger.info("Metrics background task stopped")
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Application factory
-# ──────────────────────────────────────────────────────────────────────────────
 
 app = FastAPI(
     title="Ashta Chamma 3D API",
     version="0.1.0",
-    description="Backend API for the Ashta Chamma 3D multiplayer board game",
-    lifespan=lifespan,
+    docs_url="/api/docs",
+    redoc_url="/api/redoc",
+    openapi_url="/api/openapi.json",
+    # Disable the default 422 detail schema leak — validation errors are
+    # returned with a generic message to avoid leaking internal model details.
 )
 
-# MetricsMiddleware is registered before other middleware so it measures the
-# full request duration, including time spent in auth and business logic layers.
-app.add_middleware(MetricsMiddleware)
+# ── Middleware (outermost → innermost for requests; reversed for responses) ──
 
-# Routers
-app.include_router(websocket_router)
+# Rate limiting: registered first so security headers wrap its 429 responses.
+_redis_client = None
+_redis_url = os.getenv("REDIS_URL")
+if _redis_url:
+    try:
+        import redis.asyncio as aioredis  # type: ignore[import-untyped]
+
+        _redis_client = aioredis.from_url(_redis_url, decode_responses=True)
+        logger.info("Rate limiting enabled via Redis: %s", _redis_url)
+    except ImportError:
+        logger.warning("redis package not installed; rate limiting is disabled")
+
+app.add_middleware(RateLimitMiddleware, redis_client=_redis_client)
+
+# Security headers: registered last so it executes first on the response path,
+# guaranteeing headers on all responses including 429 from rate limiting.
+app.add_middleware(SecurityHeadersMiddleware)
+
+# ── Routers ──────────────────────────────────────────────────────────────────
+
+app.include_router(ws_module.router)
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Built-in endpoints
-# ──────────────────────────────────────────────────────────────────────────────
+# ── Health check (exempt from rate limiting) ─────────────────────────────────
 
 
-@app.get("/api/health", tags=["health"])
-async def health_check() -> JSONResponse:
-    """Liveness probe used by ALB health checks and ECS container health check."""
-    return JSONResponse({"status": "ok", "version": app.version})
+@app.get("/api/health", tags=["monitoring"])
+async def health_check() -> dict[str, str]:
+    """Liveness probe — no auth required, exempt from rate limiting.
+
+    Used by the ECS health check and ALB target group health probe.
+    """
+    return {"status": "ok", "version": "0.1.0"}

@@ -1,156 +1,143 @@
-"""WebSocket route for real-time in-game communication.
+"""WebSocket route handler for real-time Ashta Chamma game communication.
 
-Each active room gets a dedicated WebSocket endpoint.  Every incoming message
-is timed and the elapsed duration is recorded as ``ws_message_latency_ms`` in
-the AshtaChamma/WebSocket CloudWatch namespace.
+Each room connection gets its own per-connection sliding window rate limiter
+(10 messages/second) tracked entirely in process memory — this is intentional
+because the limit is per *connection*, not per user, and does not need to be
+shared across tasks.
 
-Architecture layer: routes (thin — parse message, call service, send response).
-Game logic dispatch will be filled in by WO-004 and subsequent work orders.
+All incoming messages are validated against the Pydantic schemas in
+``app.schemas.ws_messages`` before dispatching to game logic handlers.
+Invalid messages return an error frame instead of crashing the handler.
+
+Logging of user-supplied values (room_id) uses ``_sanitize`` to prevent
+log injection.
 """
 
+import json
 import logging
 import time
-from typing import Any
+from collections import deque
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
+from app.schemas.ws_messages import (
+    ChatMessage,
+    ErrorMessage,
+    PingMessage,
+    RollRequestMessage,
+    SelectPawnMessage,
+    validate_ws_message,
+)
+
 logger = logging.getLogger(__name__)
 
-router = APIRouter(prefix="/ws", tags=["websocket"])
+router = APIRouter()
 
-WS_NAMESPACE = "AshtaChamma/WebSocket"
-
-# Buffer of latency samples waiting to be flushed.  The event loop is
-# single-threaded so plain list mutation is safe (no lock needed here).
-_ws_latency_buffer: list[float] = []
-
-# Trigger an eager flush when the buffer reaches this size to bound memory use.
-# Normal flush cadence (60 s) is handled by the background task in main.py.
-_WS_BUFFER_FLUSH_THRESHOLD = 500
+# Per-connection WebSocket rate limit: 10 messages per second.
+_WS_RATE_LIMIT: int = 10
+_WS_RATE_WINDOW: float = 1.0  # seconds
 
 
-def get_ws_latency_buffer() -> list[float]:
-    """Return a copy of the current WebSocket latency buffer.
+def _is_rate_limited(message_timestamps: deque[float]) -> bool:
+    """Check and update the per-connection sliding window rate limiter.
 
-    Exposed for testing so callers can inspect buffered samples.
+    Removes timestamps older than the 1-second window, then checks whether
+    the connection has already sent *_WS_RATE_LIMIT* messages in that window.
+    Appends the current timestamp only when the request is *not* rate-limited
+    so dropped messages do not consume a slot.
+
+    Returns:
+        True if the message should be dropped (rate limit exceeded).
+        False if the message is within limits (timestamp recorded).
     """
-    return list(_ws_latency_buffer)
+    now = time.monotonic()
+    cutoff = now - _WS_RATE_WINDOW
+    while message_timestamps and message_timestamps[0] < cutoff:
+        message_timestamps.popleft()
+    if len(message_timestamps) >= _WS_RATE_LIMIT:
+        return True
+    message_timestamps.append(now)
+    return False
 
 
-def clear_ws_latency_buffer() -> None:
-    """Clear the WebSocket latency buffer (used in tests and by the flush task)."""
-    _ws_latency_buffer.clear()
+def _sanitize(value: str) -> str:
+    """Return *value* with only alphanumeric characters and ``-_`` kept.
 
-
-def flush_ws_metrics(cloudwatch_client: Any | None = None) -> None:
-    """Publish buffered WebSocket latency samples to CloudWatch and clear the buffer.
-
-    Args:
-        cloudwatch_client: Injected boto3 CloudWatch client (for testing).
+    Used before interpolating user-supplied strings into log messages to
+    prevent log injection attacks.
     """
-    if not _ws_latency_buffer:
-        return
-
-    latencies = list(_ws_latency_buffer)
-    _ws_latency_buffer.clear()
-
-    if cloudwatch_client is None:
-        import boto3  # noqa: PLC0415
-
-        cloudwatch_client = boto3.client("cloudwatch")
-
-    from botocore.exceptions import BotoCoreError, ClientError  # noqa: PLC0415
-
-    metric_data = [
-        {"MetricName": "ws_message_latency_ms", "Value": lat, "Unit": "Milliseconds"}
-        for lat in latencies
-    ]
-
-    chunk_size = 20
-    for i in range(0, len(metric_data), chunk_size):
-        try:
-            cloudwatch_client.put_metric_data(
-                Namespace=WS_NAMESPACE,
-                MetricData=metric_data[i : i + chunk_size],
-            )
-        except (BotoCoreError, ClientError) as exc:
-            logger.warning("Failed to publish WebSocket metrics to CloudWatch: %s", exc)
+    return "".join(c for c in value if c.isalnum() or c in "-_")
 
 
-def _record_ws_latency(elapsed_ms: float) -> None:
-    """Append a latency sample to the buffer; flush early if threshold is reached."""
-    _ws_latency_buffer.append(elapsed_ms)
-    if len(_ws_latency_buffer) >= _WS_BUFFER_FLUSH_THRESHOLD:
-        flush_ws_metrics()
+@router.websocket("/ws/rooms/{room_id}")
+async def websocket_room_endpoint(websocket: WebSocket, room_id: str) -> None:
+    """Accept a WebSocket connection for a game room.
 
-
-@router.websocket("/rooms/{room_id}")
-async def websocket_room(websocket: WebSocket, room_id: str) -> None:
-    """WebSocket endpoint for real-time game communication within a room.
-
-    Accepts connections, receives JSON messages, measures per-message processing
-    time, and records it via ``_record_ws_latency``.
-
-    Game state machine dispatch (roll, move, chat) will be wired in by WO-004
-    and subsequent work orders.  Until then, unknown message types receive a
-    NOT_IMPLEMENTED error response so the WebSocket contract is preserved.
-
-    Args:
-        websocket: The active WebSocket connection.
-        room_id: UUID of the game room (validated by RoomManager in a later WO).
+    Per-connection responsibilities:
+    - Enforce 10 messages/second rate limit; drop excess with a warning frame.
+    - Validate every message against the defined schema before dispatching.
+    - Return ``{type: 'error', message: 'Invalid message format'}`` for bad messages.
     """
     await websocket.accept()
-    logger.info("WebSocket connection accepted: room_id=%s", room_id)
+    message_timestamps: deque[float] = deque()
+    safe_room_id = _sanitize(room_id)
 
     try:
         while True:
-            message: dict[str, Any] = await websocket.receive_json()
-            start = time.perf_counter()
+            raw = await websocket.receive_text()
 
-            msg_type: str = message.get("type", "")
-            logger.debug("Received WS message: type=%s room_id=%s", msg_type, room_id)
+            # Drop excess messages but notify the sender.
+            if _is_rate_limited(message_timestamps):
+                logger.warning(
+                    "WebSocket rate limit exceeded: room=%s; dropping message",
+                    safe_room_id,
+                )
+                await websocket.send_text(
+                    json.dumps({"type": "error", "message": "Rate limit exceeded: slow down"})
+                )
+                continue
 
-            # Game logic dispatch — stubbed pending WO-004+
-            # Each handled type will record its own elapsed time before calling
-            # _record_ws_latency so the measurement includes processing cost.
-            response_payload = _dispatch_message(msg_type, message, room_id)
+            # Validate message schema; send generic error on failure to avoid
+            # leaking internal Pydantic error details to the client.
+            try:
+                message = validate_ws_message(raw)
+            except ValueError:
+                error = ErrorMessage(message="Invalid message format")
+                await websocket.send_text(error.model_dump_json())
+                continue
 
-            elapsed_ms = (time.perf_counter() - start) * 1_000.0
-            _record_ws_latency(elapsed_ms)
-
-            await websocket.send_json(response_payload)
+            await _dispatch(websocket, safe_room_id, message)
 
     except WebSocketDisconnect:
-        logger.info("WebSocket disconnected: room_id=%s", room_id)
-    except Exception as exc:
-        logger.exception("WebSocket error: room_id=%s error=%s", room_id, exc)
-        await websocket.close(code=1011)
+        logger.info("Client disconnected: room=%s", safe_room_id)
 
 
-def _dispatch_message(
-    msg_type: str, message: dict[str, Any], room_id: str
-) -> dict[str, Any]:
-    """Route a WebSocket message to the appropriate handler.
+async def _dispatch(
+    websocket: WebSocket,
+    safe_room_id: str,
+    message: RollRequestMessage | SelectPawnMessage | ChatMessage | PingMessage,
+) -> None:
+    """Route a validated message to the appropriate handler stub.
 
-    Returns a response payload dict.  Stub implementation — game logic
-    handlers (roll_request, select_pawn, chat, ping) will replace this
-    in subsequent work orders.
-
-    Args:
-        msg_type: The ``type`` field from the incoming JSON message.
-        message: Full message dict.
-        room_id: Active room identifier.
-
-    Returns:
-        JSON-serialisable response dict.
+    Full game logic integration will be added in WO-016 (WebSocket handler
+    with Redis pub/sub).  For now, only the ping/pong round-trip is
+    implemented so the endpoint is functional and testable.
     """
-    if msg_type == "ping":
-        return {"type": "pong"}
+    if isinstance(message, PingMessage):
+        await websocket.send_text(json.dumps({"type": "pong"}))
 
-    # All other types are not yet implemented
-    logger.debug("Unhandled WS message type=%s room_id=%s", msg_type, room_id)
-    return {
-        "type": "error",
-        "code": "NOT_IMPLEMENTED",
-        "message": f"Message type '{msg_type}' is not yet implemented.",
-    }
+    elif isinstance(message, RollRequestMessage):
+        # TODO(WO-016): Delegate to GameStateMachine.handle_roll_request()
+        logger.debug("Roll request received: room=%s", safe_room_id)
+
+    elif isinstance(message, SelectPawnMessage):
+        # TODO(WO-016): Delegate to GameStateMachine.handle_select_pawn()
+        logger.debug(
+            "Select pawn %d: room=%s",
+            message.pawn_id,
+            safe_room_id,
+        )
+
+    elif isinstance(message, ChatMessage):
+        # TODO(WO-016): Broadcast via Redis pub/sub
+        logger.debug("Chat received: room=%s", safe_room_id)
