@@ -1,0 +1,11 @@
+# Load test dependencies — install with:
+#   pip install -r load-tests/requirements.txt
+#
+# These packages are NOT part of the main server environment; they are only
+# needed to run load tests from a CI runner or a developer's machine.
+
+locust>=2.32.0
+websocket-client>=1.8.0
+PyJWT>=2.9.0
+pytest>=8.3.0
+pytest-asyncio>=0.24.0
