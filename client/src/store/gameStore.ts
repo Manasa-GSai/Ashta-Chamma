@@ -1,77 +1,121 @@
 import { create } from 'zustand';
+import { devtools } from 'zustand/middleware';
+import {
+  GamePhase,
+  Screen,
+  type GameState,
+  type GameStore,
+  type RoomState,
+  type UserProfile,
+  type UserState,
+  type UIState,
+} from './types';
 
-export type GamePhase =
-  | 'WAITING'
-  | 'ROLLING'
-  | 'SELECTING'
-  | 'MOVING'
-  | 'CAPTURING'
-  | 'GAME_OVER';
+// ---------------------------------------------------------------------------
+// Default initial values for each slice
+// ---------------------------------------------------------------------------
+
+const initialGameState: GameState = {
+  pawns: [],
+  currentPlayerIndex: 0,
+  gamePhase: GamePhase.WAITING,
+  currentRoll: null,
+  legalMoveIds: [],
+};
+
+const initialRoomState: RoomState = {
+  roomCode: null,
+  players: [],
+  roomStatus: 'WAITING',
+};
+
+const initialUserState: UserState = {
+  profile: null,
+  isAuthenticated: false,
+};
+
+const initialUIState: UIState = {
+  currentScreen: Screen.MAIN_MENU,
+  isLoading: false,
+  errorMessage: null,
+  locale: 'en',
+};
+
+// ---------------------------------------------------------------------------
+// Store
+// ---------------------------------------------------------------------------
 
 /**
- * Represents a single legal move option returned by the server's move_options
- * message. Holds the pawn that may move and the board index it will land on.
+ * useGameStore is the single Zustand store for all client state.
+ *
+ * It is organised into four logical slices:
+ *   - Game   — board positions, current player, phase, roll, legal moves
+ *   - Room   — room code, participant list, room lifecycle status
+ *   - User   — authenticated user profile
+ *   - UI     — active screen, loading flag, error message, locale
+ *
+ * The devtools middleware integrates with the Redux DevTools Extension for
+ * time-travel debugging during development.
  */
-export interface MoveOption {
-  pawn_id: number;
-  target_pos: number;
-}
+export const useGameStore = create<GameStore>()(
+  devtools(
+    (set) => ({
+      // ----- Game slice -----
+      ...initialGameState,
 
-export interface GameStore {
-  gamePhase: GamePhase;
-  currentPlayerId: string | null;
-  localPlayerId: string | null;
-  /** IDs of pawns that the current player may select this turn. */
-  legalMoveIds: number[];
-  /** Full move options including destination positions (for destination highlights). */
-  moveOptions: MoveOption[];
-  selectedPawnId: number | null;
+      /**
+       * Merge a partial state delta from the server into the game slice.
+       * Only fields present in `delta` are overwritten; all other state is preserved.
+       * Zustand performs a shallow top-level merge, so this is always immutable.
+       */
+      updateGameState: (delta: Partial<GameState>) =>
+        set(delta as Partial<GameStore>, false, 'game/updateGameState'),
 
-  // --- Actions ---
-  setGamePhase: (phase: GamePhase) => void;
-  /**
-   * Ingest move_options from the server, populate legalMoveIds, and
-   * transition to the SELECTING phase so Pawn3D components become clickable.
-   */
-  setMoveOptions: (options: MoveOption[]) => void;
-  setSelectedPawnId: (pawnId: number | null) => void;
-  setCurrentPlayer: (playerId: string | null) => void;
-  setLocalPlayer: (playerId: string | null) => void;
-  /**
-   * Clear all selection state once the player has chosen a pawn.
-   * Called immediately after dispatching select_pawn so highlights disappear
-   * and no further clicks are processed.
-   */
-  clearSelection: () => void;
-}
+      // ----- Room slice -----
+      ...initialRoomState,
 
-export const useGameStore = create<GameStore>((set) => ({
-  gamePhase: 'WAITING',
-  currentPlayerId: null,
-  localPlayerId: null,
-  legalMoveIds: [],
-  moveOptions: [],
-  selectedPawnId: null,
+      /**
+       * Replace or merge room metadata received from the server (e.g. after a
+       * join response or a player_joined WebSocket event).
+       */
+      setRoomState: (room: Partial<RoomState>) =>
+        set(room as Partial<GameStore>, false, 'room/setRoomState'),
 
-  setGamePhase: (phase) => set({ gamePhase: phase }),
+      // ----- User slice -----
+      ...initialUserState,
 
-  setMoveOptions: (options) =>
-    set({
-      moveOptions: options,
-      legalMoveIds: options.map((o) => o.pawn_id),
-      gamePhase: 'SELECTING',
+      /**
+       * Set the authenticated user's profile.
+       * Passing null clears the profile and marks the user as unauthenticated,
+       * which is used on logout or JWT expiry.
+       */
+      setUser: (profile: UserProfile | null) =>
+        set(
+          { profile, isAuthenticated: profile !== null },
+          false,
+          'user/setUser',
+        ),
+
+      // ----- UI slice -----
+      ...initialUIState,
+
+      setCurrentScreen: (screen) =>
+        set({ currentScreen: screen }, false, 'ui/setCurrentScreen'),
+
+      setLoading: (loading: boolean) =>
+        set({ isLoading: loading }, false, 'ui/setLoading'),
+
+      /** Show an error banner — typically triggered by a server error message. */
+      setError: (message: string) =>
+        set({ errorMessage: message }, false, 'ui/setError'),
+
+      /** Dismiss the error banner once the user acknowledges it. */
+      clearError: () =>
+        set({ errorMessage: null }, false, 'ui/clearError'),
+
+      setLocale: (locale: string) =>
+        set({ locale }, false, 'ui/setLocale'),
     }),
-
-  setSelectedPawnId: (pawnId) => set({ selectedPawnId: pawnId }),
-
-  setCurrentPlayer: (playerId) => set({ currentPlayerId: playerId }),
-
-  setLocalPlayer: (playerId) => set({ localPlayerId: playerId }),
-
-  clearSelection: () =>
-    set({
-      selectedPawnId: null,
-      legalMoveIds: [],
-      moveOptions: [],
-    }),
-}));
+    { name: 'AshtaChammaStore' },
+  ),
+);
