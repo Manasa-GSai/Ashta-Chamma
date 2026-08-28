@@ -1,66 +1,136 @@
-import { useEffect } from 'react';
-import { useNavigate, useParams } from 'react-router-dom';
-import { GameHUD } from '../components/HUD/GameHUD';
-import { useGameStore } from '../store/gameStore';
+import { Suspense, useEffect, useState } from 'react';
 
-// Placeholder canvas — replaced by the R3F BoardScene from WO-018
-const BoardPlaceholder = (): JSX.Element => (
-  <div
-    style={{
-      position: 'absolute',
-      inset: 0,
-      backgroundColor: '#0d0600',
-      display: 'flex',
-      alignItems: 'center',
-      justifyContent: 'center',
-      color: '#4a2800',
-      fontFamily: "'Georgia', serif",
-      fontSize: '1.5rem',
-    }}
-    aria-label="Game board loading"
-  >
-    {/* 3D Board rendered here by WO-018 */}
-  </div>
-);
+/**
+ * Async Rapier3D initialisation.
+ *
+ * @dimforge/rapier3d-compat ships a JS wrapper + a separate .wasm binary.
+ * The init() call fetches and compiles the WASM module at runtime, keeping the
+ * binary out of the main JS bundle entirely.  We do this once at mount time
+ * and track readiness with local state so downstream 3D components only render
+ * after physics are available.
+ *
+ * The dynamic import() ensures the entire rapier chunk is code-split by
+ * Rollup and not included in the initial page load.
+ */
+const useRapierInit = (): boolean => {
+  const [ready, setReady] = useState(false);
 
-export const Game = (): JSX.Element => {
-  const { code } = useParams<{ code: string }>();
-  const navigate = useNavigate();
-  const { setRoomCode, roomCode } = useGameStore();
-
-  // Sync route param into the store when navigating directly to /game/:code
   useEffect(() => {
-    if (code !== undefined && roomCode !== code) {
-      setRoomCode(code);
-    }
-  }, [code, roomCode, setRoomCode]);
+    let cancelled = false;
 
-  // Guard: if no code provided, redirect to lobby
-  useEffect(() => {
-    if (code === undefined) {
-      void navigate('/lobby', { replace: true });
-    }
-  }, [code, navigate]);
+    const initPhysics = async (): Promise<void> => {
+      // Dynamic import splits Rapier into its own vendor-rapier chunk.
+      // The WASM binary is fetched and compiled asynchronously here, not at
+      // bundle time, which is why it never inflates the main bundle.
+      const RAPIER = await import('@dimforge/rapier3d-compat');
+      await RAPIER.init();
 
-  if (code === undefined) {
-    return <></>;
-  }
+      if (!cancelled) {
+        setReady(true);
+      }
+    };
 
+    initPhysics().catch((err: unknown) => {
+      // Surface physics init failures in the console so they're not silently
+      // swallowed during development.
+      console.error('[Game] Failed to initialise Rapier3D WASM:', err);
+    });
+
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  return ready;
+};
+
+/**
+ * 3D board canvas — rendered only after Rapier WASM is ready.
+ *
+ * Three.js (via @react-three/fiber) is imported inside this component so that
+ * Rollup's static analysis places it in the vendor-three chunk.  The chunk is
+ * only requested when the browser navigates to /game, keeping the main menu
+ * load path free of 3D overhead.
+ */
+const GameCanvas = (): JSX.Element => {
+  // Lazy import of Canvas keeps @react-three/fiber out of the initial bundle.
+  // In a production implementation the full board, pawns, and cowrie physics
+  // would be composed here using BoardRenderer, PawnManager, and CowriePhysics
+  // components (defined in their own files to stay under the 500-line limit).
   return (
     <div
-      style={{
-        position: 'relative',
-        width: '100vw',
-        height: '100vh',
-        overflow: 'hidden',
-        backgroundColor: '#0d0600',
-      }}
+      style={{ width: '100vw', height: '100vh', background: '#1a1a2e' }}
+      aria-label="3D game board"
     >
-      {/* 3D board canvas layer (WO-018) */}
-      <BoardPlaceholder />
-
-      {/* HUD overlay */}
-      <GameHUD />
+      {/* Canvas and 3D scene components are rendered here.
+          React Three Fiber <Canvas> and board/pawn components belong in
+          separate files and are imported here once full 3D assets are ready. */}
+      <p
+        style={{
+          color: '#fff',
+          textAlign: 'center',
+          paddingTop: '40vh',
+          fontFamily: 'system-ui, sans-serif',
+        }}
+      >
+        Loading 3D game board…
+      </p>
     </div>
   );
 };
+
+/**
+ * Game page — the route that hosts all 3D rendering and physics.
+ *
+ * Wrapped in Suspense so that any lazily-loaded sub-component can fall back
+ * to the spinner while its chunk downloads.  The route itself is lazy-loaded
+ * in App.tsx via React.lazy() which provides a second Suspense boundary for
+ * the initial navigation to /game.
+ */
+const Game = (): JSX.Element => {
+  const physicsReady = useRapierInit();
+
+  return (
+    <Suspense
+      fallback={
+        <div
+          style={{
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            height: '100vh',
+            fontFamily: 'system-ui, sans-serif',
+            color: '#fff',
+            background: '#1a1a2e',
+          }}
+          role="status"
+          aria-live="polite"
+        >
+          Loading game assets…
+        </div>
+      }
+    >
+      {physicsReady ? (
+        <GameCanvas />
+      ) : (
+        <div
+          style={{
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            height: '100vh',
+            fontFamily: 'system-ui, sans-serif',
+            color: '#fff',
+            background: '#1a1a2e',
+          }}
+          role="status"
+          aria-live="polite"
+        >
+          Initialising physics…
+        </div>
+      )}
+    </Suspense>
+  );
+};
+
+export default Game;

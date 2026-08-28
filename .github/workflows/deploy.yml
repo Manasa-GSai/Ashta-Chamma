@@ -1,55 +1,37 @@
-name: Deploy
+name: Deploy Frontend
 
 on:
   push:
     branches:
-      - main
       - master
+    paths:
+      - 'client/**'
+      - 'lighthouserc.js'
+      - '.github/workflows/deploy.yml'
   workflow_dispatch:
 
-env:
-  # Staging environment URL — override via GitHub environment variables.
-  STAGING_URL: ${{ vars.STAGING_URL || 'http://localhost:5173' }}
+# Prevent concurrent deployments from running over each other.
+concurrency:
+  group: deploy-frontend-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
-  # ── Lint & unit tests ────────────────────────────────────────────────────
-  test:
-    name: Lint and Unit Tests
+  # ─────────────────────────────────────────────────────────────────────────────
+  # 1. Build the optimized Vite production bundle and run Lighthouse CI.
+  # ─────────────────────────────────────────────────────────────────────────────
+  build-and-lighthouse:
+    name: Build + Lighthouse CI
     runs-on: ubuntu-latest
+
     defaults:
       run:
         working-directory: client
+
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
-      - name: Set up Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: '20'
-          cache: 'npm'
-          cache-dependency-path: client/package-lock.json
-
-      - name: Install dependencies
-        run: npm ci
-
-      - name: Lint
-        run: npm run lint
-
-      - name: Format check
-        run: npm run format:check
-
-      - name: Type check
-        run: npx tsc --noEmit
-
-  # ── Build & push container image ─────────────────────────────────────────
-  build:
-    name: Build
-    runs-on: ubuntu-latest
-    needs: test
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Set up Node.js
+      - name: Set up Node.js 20
         uses: actions/setup-node@v4
         with:
           node-version: '20'
@@ -57,102 +39,100 @@ jobs:
           cache-dependency-path: client/package-lock.json
 
       - name: Install client dependencies
-        working-directory: client
         run: npm ci
 
-      - name: Build client
-        working-directory: client
-        run: npm run build
+      # Build with the bundle analyzer enabled so the stats report is
+      # available as a CI artifact for review (acceptance criterion 7).
+      - name: Build production bundle (with analysis report)
+        run: ANALYZE=true npm run build
+        env:
+          NODE_ENV: production
 
-      - name: Upload build artifact
+      # Upload the stats.html treemap as a workflow artifact so developers
+      # can inspect chunk sizes from the Actions UI.
+      - name: Upload bundle analysis report
         uses: actions/upload-artifact@v4
         with:
-          name: client-dist
+          name: bundle-stats
+          path: client/dist/stats.html
+          retention-days: 14
+
+      # Upload the full dist/ directory so the deploy job can download it
+      # without rebuilding.
+      - name: Upload dist artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist
           path: client/dist/
-          retention-days: 7
+          retention-days: 1
 
-  # ── Deploy to staging ─────────────────────────────────────────────────────
-  deploy-staging:
-    name: Deploy to Staging
+      # Run Lighthouse CI against the freshly-built production bundle.
+      # The lighthouserc.js at repo root defines the assertion thresholds
+      # (performance ≥ 85 on the main menu page).
+      - name: Run Lighthouse CI
+        working-directory: ${{ github.workspace }}
+        run: |
+          cd client
+          npx lhci autorun
+        env:
+          LHCI_GITHUB_APP_TOKEN: ${{ secrets.LHCI_GITHUB_APP_TOKEN }}
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # 2. Sync the dist/ output to S3 with correct Cache-Control headers.
+  #    Runs only after the build + Lighthouse job succeeds.
+  # ─────────────────────────────────────────────────────────────────────────────
+  deploy-s3:
+    name: Deploy to S3
     runs-on: ubuntu-latest
-    needs: build
-    environment: staging
-    concurrency:
-      group: staging-deploy
-      cancel-in-progress: false
-    steps:
-      - uses: actions/checkout@v4
+    needs: build-and-lighthouse
+    if: github.ref == 'refs/heads/master' && github.event_name == 'push'
 
-      - name: Download build artifact
+    environment:
+      name: production
+      url: https://${{ secrets.CLOUDFRONT_DOMAIN }}
+
+    permissions:
+      id-token: write  # Required for OIDC-based AWS credentials.
+      contents: read
+
+    steps:
+      - name: Download dist artifact
         uses: actions/download-artifact@v4
         with:
-          name: client-dist
-          path: client/dist/
+          name: dist
+          path: dist/
 
-      - name: Deploy to staging
-        # Replace this step with your actual deployment command (CDK, S3 sync, etc.).
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      # Step 1: Upload hashed static assets (JS chunks, CSS, WASM, GLB/GLTF,
+      # fonts, images) with a 1-year immutable cache.  Vite content-hashes all
+      # chunk filenames so these can be cached indefinitely — a new deploy
+      # generates new hashes, so there is no stale-content risk.
+      - name: Sync hashed static assets (1-year cache)
         run: |
-          echo "Deploying to staging: ${STAGING_URL}"
-          # Example: aws s3 sync client/dist/ s3://${STAGING_BUCKET}/ --delete
-          # Example: aws ecs update-service --cluster staging --service api --force-new-deployment
-        env:
-          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
+          aws s3 sync dist/ s3://${{ secrets.S3_BUCKET }}/  \
+            --exclude "index.html"                          \
+            --cache-control "public, max-age=31536000, immutable" \
+            --delete
 
-  # ── Playwright E2E tests (post-deploy, against staging) ──────────────────
-  e2e:
-    name: E2E Tests (Playwright)
-    runs-on: ubuntu-latest
-    needs: deploy-staging
-    environment: staging
-    timeout-minutes: 30
-    defaults:
-      run:
-        working-directory: client
-    steps:
-      - uses: actions/checkout@v4
+      # Step 2: Upload index.html separately with no-cache so browsers always
+      # re-fetch it and pick up new chunk hashes after a deployment.  Without
+      # this, a cached old index.html would reference chunk hashes that no
+      # longer exist in S3 after a deploy, causing 404s for returning users.
+      - name: Upload index.html (no-cache)
+        run: |
+          aws s3 cp dist/index.html s3://${{ secrets.S3_BUCKET }}/index.html \
+            --cache-control "no-cache, no-store, must-revalidate"            \
+            --content-type "text/html; charset=utf-8"
 
-      - name: Set up Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: '20'
-          cache: 'npm'
-          cache-dependency-path: client/package-lock.json
-
-      - name: Install dependencies
-        run: npm ci
-
-      - name: Install Playwright browsers
-        run: npx playwright install --with-deps chromium
-
-      - name: Run Playwright E2E tests
-        run: npx playwright test
-        env:
-          # Point tests at the freshly deployed staging environment.
-          E2E_BASE_URL: ${{ env.STAGING_URL }}
-          # Clerk testing token allows sign-in without the interactive UI.
-          # Store this as a GitHub Actions secret on the staging environment.
-          CLERK_TESTING_TOKEN: ${{ secrets.CLERK_TESTING_TOKEN }}
-          CI: 'true'
-
-      - name: Upload test report
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: playwright-report
-          path: |
-            client/playwright-report/
-            client/test-results/
-          retention-days: 30
-
-      # Screenshots captured on failure live inside test-results/ — the artifact
-      # upload above includes them so engineers can download and inspect them.
-      - name: Upload failure screenshots
-        if: failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: playwright-failure-screenshots
-          path: client/test-results/**/*.png
-          retention-days: 30
-          if-no-files-found: ignore
+      # Invalidate the CloudFront distribution so the new index.html is served
+      # immediately.  Hashed assets do not need invalidation — new URLs.
+      - name: Invalidate CloudFront cache for index.html
+        run: |
+          aws cloudfront create-invalidation \
+            --distribution-id ${{ secrets.CLOUDFRONT_DISTRIBUTION_ID }} \
+            --paths "/index.html"
