@@ -1,1 +1,1 @@
-"""Service layer — coordinates domain logic and external integrations."""
+"""Services package for Ashta Chamma 3D backend."""

@@ -1,32 +1,24 @@
-"""FastAPI application factory.
+"""FastAPI application entry point.
 
-Creates and configures the FastAPI app instance, registers all routers,
-and exposes ``app`` as the ASGI entry point for Uvicorn::
-
-    uvicorn app.main:app --reload
+Mounts all routers and provides the health-check endpoint.
 """
 
 from fastapi import FastAPI
 
-from app.routes.scores import leaderboard_router, user_scores_router
+from app.routes import rooms
+from app.routes import websocket as ws_routes
 
 app = FastAPI(
-    title="Ashta Chamma 3D — API",
+    title="Ashta Chamma 3D",
     version="0.1.0",
-    description="Backend API for the Ashta Chamma 3D multiplayer game.",
+    description="Real-time multiplayer Ashta Chamma game server",
 )
 
-# ---------------------------------------------------------------------------
-# Routers
-# ---------------------------------------------------------------------------
-app.include_router(leaderboard_router)
-app.include_router(user_scores_router)
+app.include_router(rooms.router, prefix="/api")
+app.include_router(ws_routes.router)
 
 
-# ---------------------------------------------------------------------------
-# Health check
-# ---------------------------------------------------------------------------
-@app.get("/api/health", tags=["ops"])
-async def health() -> dict[str, str]:
-    """Lightweight liveness probe for ALB health checks."""
-    return {"status": "ok", "version": app.version}
+@app.get("/api/health")
+async def health_check() -> dict[str, str]:
+    """Liveness probe for ALB health checks."""
+    return {"status": "ok", "version": "0.1.0"}

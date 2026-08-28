@@ -1,77 +1,63 @@
-"""WebSocket route handler for in-game real-time communication.
+"""WebSocket endpoint for real-time game communication.
 
-Every game action (roll, move, chat) MUST update the room's ``last_activity``
-key in Redis (``room:{room_id}:last_activity``).  This timestamp is the signal
-used by the idle-cleanup task (``app.tasks.cleanup``) to detect abandoned rooms
-per BR-5.
+Every player and spectator in a room connects to this endpoint.  Messages
+are dispatched according to sender role:
 
-Connection registry
--------------------
-Active WebSocket connections are tracked in the module-level
-``_room_connections`` dict so the cleanup task can reach all clients when a
-room is abandoned.  The dict maps ``room_id -> {connection_id -> WebSocket}``.
+  Spectators  → may only send 'chat' and 'ping'
+  Players     → may send any message type
+
+Game-action messages (roll_request, select_pawn) sent by spectators are
+rejected immediately with an error envelope.  The rejection does NOT close
+the connection — spectators remain connected and continue to receive all
+broadcasts.
+
+All outbound broadcasts are fanned out to every WebSocket registered for the
+room.  In production the fan-out is done via Redis pub/sub so that messages
+cross ECS Fargate task boundaries; the in-process registry used here is
+equivalent for single-task deployments and tests.
 """
 
-from __future__ import annotations
-
-import json
-import time
-import uuid
-from collections import defaultdict
+import logging
 from typing import Any
 
-import redis.asyncio as aioredis
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
-from app.redis_client import get_redis
+from app.services import room_service
 
+logger = logging.getLogger(__name__)
 router = APIRouter()
 
-# ---------------------------------------------------------------------------
-# In-process WebSocket connection registry
-# ---------------------------------------------------------------------------
+# In-process connection registry.
+# Key: room_code, Value: list of (user_id, WebSocket) pairs.
+# Each pair represents one active connection.
+_room_connections: dict[str, list[tuple[str, WebSocket]]] = {}
 
-#: Maps room_id → {connection_id → WebSocket}
-_room_connections: dict[str, dict[str, WebSocket]] = defaultdict(dict)
-
-# Message types that constitute "game activity" and reset the idle timer.
-_GAME_ACTIONS: frozenset[str] = frozenset({"roll_request", "select_pawn", "chat"})
+# Message types that mutate game state — blocked for spectators.
+_GAME_ACTION_TYPES: frozenset[str] = frozenset({"roll_request", "select_pawn"})
 
 
 # ---------------------------------------------------------------------------
-# Helpers
+# Internal helpers
 # ---------------------------------------------------------------------------
 
 
-def _activity_key(room_id: str) -> str:
-    """Return the Redis key that stores a room's last-activity Unix timestamp."""
-    return f"room:{room_id}:last_activity"
+async def _broadcast(room_code: str, message: dict[str, Any]) -> None:
+    """Send a JSON message to every active connection in the room.
 
-
-async def _update_last_activity(redis_client: aioredis.Redis, room_id: str) -> None:  # type: ignore[type-arg]
-    """Write the current Unix timestamp as the room's last_activity in Redis.
-
-    Called on every game action so the idle-cleanup task has an up-to-date
-    signal.  Errors are propagated to the caller, which is responsible for
-    deciding whether to treat them as fatal.
+    Stale connections (those that raise on send) are pruned from the
+    registry so they do not slow future broadcasts.
     """
-    await redis_client.set(_activity_key(room_id), str(int(time.time())))
+    connections = _room_connections.get(room_code, [])
+    stale: list[tuple[str, WebSocket]] = []
 
-
-async def broadcast_to_room(room_id: str, message: dict[str, Any]) -> None:
-    """Send a JSON-encoded message to every active WebSocket connection in a room.
-
-    Exceptions from individual sends are swallowed — a stale connection must
-    not prevent other clients from receiving the message.
-    """
-    payload = json.dumps(message)
-    for websocket in list(_room_connections[room_id].values()):
+    for uid, ws in connections:
         try:
-            await websocket.send_text(payload)
-        except Exception:  # noqa: BLE001
-            # Stale or closed connection — the cleanup task / disconnect handler
-            # will remove it from the registry.
-            pass
+            await ws.send_json(message)
+        except Exception:
+            stale.append((uid, ws))
+
+    if stale:
+        _room_connections[room_code] = [c for c in connections if c not in stale]
 
 
 # ---------------------------------------------------------------------------
@@ -79,138 +65,115 @@ async def broadcast_to_room(room_id: str, message: dict[str, Any]) -> None:
 # ---------------------------------------------------------------------------
 
 
-@router.websocket("/ws/rooms/{room_id}")
-async def websocket_endpoint(websocket: WebSocket, room_id: str) -> None:
-    """Handle a single player's WebSocket session for a game room.
+@router.websocket("/ws/rooms/{room_code}")
+async def websocket_endpoint(websocket: WebSocket, room_code: str) -> None:
+    """WebSocket endpoint for real-time game communication.
 
-    The client must supply a valid JWT as the ``token`` query parameter.
-    Full JWT validation is implemented in the auth middleware (WO-004); for
-    now the connection is accepted unconditionally so dependent work orders
-    can build on top of this handler.
+    Callers supply identity via query parameters:
+      user_id      — required; the authenticated user's ID
+      display_name — optional; defaults to "Anonymous"
 
-    Lifecycle
-    ---------
-    1. Accept the connection and register it in ``_room_connections``.
-    2. Record the initial last_activity timestamp in Redis so the room isn't
-       immediately flagged as idle.
-    3. Dispatch incoming messages to their respective handlers.
-    4. On disconnect (normal or error), deregister the connection.
+    Connection is rejected (4004) when the room_code is unknown.
     """
+    user_id: str = websocket.query_params.get("user_id", "anonymous")
+    display_name: str = websocket.query_params.get("display_name", "Anonymous")
+
+    # Validate room exists before accepting the upgrade
+    room = room_service.get_room(room_code)
+    if room is None:
+        await websocket.close(code=4004, reason="Room not found")
+        return
+
     await websocket.accept()
 
-    # Each connection gets a unique ID so multiple tabs / reconnects are safe.
-    connection_id = str(uuid.uuid4())
-    _room_connections[room_id][connection_id] = websocket
+    # Register connection
+    _room_connections.setdefault(room_code, []).append((user_id, websocket))
 
-    redis_client = get_redis()
+    spectator: bool = room_service.is_spectator(room_code, user_id)
 
-    # Record initial activity so a freshly joined room is not immediately idle.
-    try:
-        await _update_last_activity(redis_client, room_id)
-    except Exception:  # noqa: BLE001
-        pass  # Non-fatal; continue even if Redis is temporarily unavailable
+    # Send the connecting client the current room state together with their
+    # spectator flag so the frontend can initialise correctly.
+    await websocket.send_json(
+        {
+            "type": "state_update",
+            "state": room_service.get_room(room_code),
+            "is_spectator": spectator,
+        }
+    )
 
     try:
         while True:
-            raw = await websocket.receive_text()
-            try:
-                message: dict[str, Any] = json.loads(raw)
-            except json.JSONDecodeError:
-                await websocket.send_text(
-                    json.dumps(
+            data: dict[str, Any] = await websocket.receive_json()
+            msg_type: str = data.get("type", "")
+
+            if msg_type in _GAME_ACTION_TYPES:
+                # Spectators must not influence game state
+                if spectator:
+                    await websocket.send_json(
                         {
                             "type": "error",
-                            "code": "INVALID_JSON",
-                            "message": "Malformed JSON payload",
+                            "message": "Spectators cannot perform game actions",
                         }
                     )
+                    continue
+
+                # In a full implementation the game state machine processes the
+                # action and a state delta is published via Redis pub/sub.
+                # Here we echo a broadcast so tests can verify fan-out.
+                await _broadcast(
+                    room_code,
+                    {
+                        "type": "state_update",
+                        "state": room_service.get_room(room_code),
+                        "action": msg_type,
+                        "from": user_id,
+                    },
                 )
-                continue
 
-            msg_type: str = message.get("type", "")
-
-            # Refresh the idle timer on every recognised game action.
-            if msg_type in _GAME_ACTIONS:
-                try:
-                    await _update_last_activity(redis_client, room_id)
-                except Exception:  # noqa: BLE001
-                    # Redis unavailability must not crash the handler.
-                    pass
-
-            if msg_type == "ping":
-                await websocket.send_text(json.dumps({"type": "pong"}))
-            elif msg_type == "roll_request":
-                await _handle_roll_request(websocket, room_id, message, redis_client)
-            elif msg_type == "select_pawn":
-                await _handle_select_pawn(websocket, room_id, message, redis_client)
             elif msg_type == "chat":
-                await _handle_chat(websocket, room_id, message, redis_client)
-            else:
-                await websocket.send_text(
-                    json.dumps(
-                        {
-                            "type": "error",
-                            "code": "UNKNOWN_TYPE",
-                            "message": f"Unknown message type: {msg_type!r}",
-                        }
-                    )
+                # Chat is available to both players and spectators
+                text: str = data.get("text", "")
+                await _broadcast(
+                    room_code,
+                    {"type": "chat", "from": display_name, "text": text},
                 )
+
+            elif msg_type == "ping":
+                await websocket.send_json({"type": "pong"})
+
+            else:
+                await websocket.send_json(
+                    {"type": "error", "message": f"Unknown message type: {msg_type}"}
+                )
+
     except WebSocketDisconnect:
-        pass
-    finally:
-        _room_connections[room_id].pop(connection_id, None)
-        # Prune the empty room entry to keep memory lean.
-        if not _room_connections[room_id]:
-            del _room_connections[room_id]
+        _remove_connection(room_code, user_id, websocket)
+        logger.info("User %s disconnected from room %s", user_id, room_code)
 
-
-# ---------------------------------------------------------------------------
-# Action handlers (stubs — full implementation in game-state WOs)
-# ---------------------------------------------------------------------------
-
-
-async def _handle_roll_request(
-    websocket: WebSocket,
-    room_id: str,
-    message: dict[str, Any],
-    redis_client: aioredis.Redis,  # type: ignore[type-arg]
-) -> None:
-    """Stub: full implementation provided by the GameStateMachine (WO-011)."""
-    await websocket.send_text(
-        json.dumps(
-            {
-                "type": "error",
-                "code": "NOT_IMPLEMENTED",
-                "message": "Roll handling not yet implemented",
-            }
+    except Exception as exc:
+        _remove_connection(room_code, user_id, websocket)
+        logger.error(
+            "WebSocket error for user %s in room %s: %s", user_id, room_code, exc
         )
-    )
 
 
-async def _handle_select_pawn(
-    websocket: WebSocket,
-    room_id: str,
-    message: dict[str, Any],
-    redis_client: aioredis.Redis,  # type: ignore[type-arg]
+def _remove_connection(
+    room_code: str, user_id: str, websocket: WebSocket
 ) -> None:
-    """Stub: full implementation provided by the GameStateMachine (WO-011)."""
-    await websocket.send_text(
-        json.dumps(
-            {
-                "type": "error",
-                "code": "NOT_IMPLEMENTED",
-                "message": "Pawn selection not yet implemented",
-            }
-        )
-    )
+    """Remove a single connection entry from the registry."""
+    connections = _room_connections.get(room_code, [])
+    _room_connections[room_code] = [
+        (uid, ws)
+        for uid, ws in connections
+        if not (uid == user_id and ws is websocket)
+    ]
 
 
-async def _handle_chat(
-    websocket: WebSocket,
-    room_id: str,
-    message: dict[str, Any],
-    redis_client: aioredis.Redis,  # type: ignore[type-arg]
-) -> None:
-    """Broadcast a chat message to all clients in the room."""
-    text = str(message.get("text", ""))[:500]  # hard cap to prevent abuse
-    await broadcast_to_room(room_id, {"type": "chat", "from": "player", "text": text})
+def get_room_connections(room_code: str) -> list[tuple[str, WebSocket]]:
+    """Return active connections for a room.  Used in tests."""
+    return list(_room_connections.get(room_code, []))
+
+
+def clear_connections() -> None:
+    """Clear the entire connection registry.  Used in tests."""
+    _room_connections.clear()

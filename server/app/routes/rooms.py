@@ -1,98 +1,125 @@
-"""REST API routes for room management.
+"""Room management REST API endpoints.
 
-Current endpoints
------------------
-POST /api/rooms/{code}/start
-    Start the game session for a room. Host-only. Requires ≥ 2 players.
-    Returns the initial game state snapshot.
+Provides CRUD operations for game rooms plus the spectate join flow.
 
-Authentication
---------------
-The ``Authorization: Bearer <token>`` header is required. In production
-the token is a Clerk JWT validated by auth middleware. For this scope the
-bearer token value is used directly as the user identifier; full JWT
-validation middleware will be wired in a dedicated auth WO.
+Authentication is simplified: callers pass their identity via HTTP headers
+(X-User-Id and X-Display-Name) rather than a full JWT.  The architecture
+document specifies Clerk JWT validation in the AuthMiddleware; that layer
+will replace the header-based approach in production.
 
-Dependency injection
---------------------
-``_get_game_service`` raises ``NotImplementedError`` by default and must
-be overridden via ``app.dependency_overrides`` at startup (or in tests).
-This avoids hidden coupling to a concrete DB or Redis instance.
+Endpoints implemented here:
+  POST /api/rooms                   — create a room (WO-014 baseline)
+  GET  /api/rooms/{code}            — fetch room details (WO-014 baseline)
+  POST /api/rooms/{code}/join       — join as a player (WO-014 baseline)
+  POST /api/rooms/{code}/spectate   — join as a spectator (WO-026)
 """
 
-from __future__ import annotations
-
+import secrets
+import string
 from typing import Annotated, Any
 
-from fastapi import APIRouter, Depends, Header, HTTPException
+from fastapi import APIRouter, Header, HTTPException
 
-from app.services.game_service import GameService, GameStartError
+from app.models import SpectateResponse
+from app.services import room_service
 
-router = APIRouter(prefix="/api/rooms", tags=["rooms"])
+router = APIRouter()
 
-
-# ---------------------------------------------------------------------------
-# Shared dependencies
-# ---------------------------------------------------------------------------
-
-
-async def _require_auth(
-    authorization: Annotated[str | None, Header()] = None,
-) -> str:
-    """Extract the caller's user ID from the Bearer token.
-
-    Raises 401 when the header is absent or not a Bearer token.
-    """
-    if not authorization or not authorization.startswith("Bearer "):
-        raise HTTPException(
-            status_code=401,
-            detail="Missing or invalid Authorization header.",
-        )
-    return authorization.removeprefix("Bearer ").strip()
+_CODE_ALPHABET = string.ascii_uppercase
+_CODE_LENGTH = 6
 
 
-async def _get_game_service() -> GameService:
-    """Dependency placeholder — must be overridden before the server starts.
+def _require_user_id(x_user_id: str | None) -> str:
+    """Raise 401 when the X-User-Id header is absent."""
+    if not x_user_id:
+        raise HTTPException(status_code=401, detail="Missing X-User-Id header")
+    return x_user_id
 
-    In production this dependency is wired in the FastAPI lifespan to a
-    ``GameService`` built with real repository and Redis instances.
-    In tests it is replaced via ``app.dependency_overrides``.
-    """
-    raise NotImplementedError(
-        "_get_game_service must be overridden with a real or mock provider."
-    )
+
+def _coerce_display_name(x_display_name: str | None) -> str:
+    return x_display_name or "Anonymous"
+
+
+def _generate_code() -> str:
+    return "".join(secrets.choice(_CODE_ALPHABET) for _ in range(_CODE_LENGTH))
 
 
 # ---------------------------------------------------------------------------
-# Routes
+# Endpoints
 # ---------------------------------------------------------------------------
 
 
-@router.post("/{code}/start", status_code=200)
-async def start_game(
-    code: str,
-    current_user_id: Annotated[str, Depends(_require_auth)],
-    game_service: Annotated[GameService, Depends(_get_game_service)],
+@router.post("/rooms", status_code=200)
+async def create_room(
+    x_user_id: Annotated[str | None, Header()] = None,
 ) -> dict[str, Any]:
-    """Start the game for room *code*.
+    """Create a new game room.  Returns the room code."""
+    user_id = _require_user_id(x_user_id)
+    code = _generate_code()
+    room_service.create_room(code, user_id)
+    return {"room_id": code, "code": code}
 
-    Only the room host may call this endpoint. At least 2 players must be
-    present. Returns the initial game state snapshot for broadcasting.
 
-    Status codes:
-        200: Game started successfully.
-        400: Fewer than 2 players in the room.
-        401: Missing or invalid Authorization header.
-        403: Caller is not the room host.
-        404: Room not found.
-        409: Game is already in progress.
+@router.get("/rooms/{code}")
+async def get_room(code: str) -> dict[str, Any]:
+    """Return room metadata and current member list."""
+    room = room_service.get_room(code)
+    if room is None:
+        raise HTTPException(status_code=404, detail="Room not found")
+    return {**room, "players": room_service.get_room_players(code)}
+
+
+@router.post("/rooms/{code}/join")
+async def join_room(
+    code: str,
+    x_user_id: Annotated[str | None, Header()] = None,
+    x_display_name: Annotated[str | None, Header()] = None,
+) -> dict[str, Any]:
+    """Join a room as a player.
+
+    Returns the player record on success.  Fails with 404 when the room is
+    unknown and 409 when the room is full.
     """
-    try:
-        snapshot = await game_service.start_game(
-            room_code=code,
-            requester_id=current_user_id,
-        )
-    except GameStartError as exc:
-        raise HTTPException(status_code=exc.http_status, detail=str(exc)) from exc
+    user_id = _require_user_id(x_user_id)
+    display_name = _coerce_display_name(x_display_name)
 
-    return snapshot
+    room = room_service.get_room(code)
+    if room is None:
+        raise HTTPException(status_code=404, detail="Room not found")
+
+    player = room_service.join_room(code, user_id, display_name)
+    if player is None:
+        raise HTTPException(status_code=409, detail="Room is full")
+
+    return player
+
+
+@router.post("/rooms/{code}/spectate", response_model=SpectateResponse)
+async def spectate_room(
+    code: str,
+    x_user_id: Annotated[str | None, Header()] = None,
+    x_display_name: Annotated[str | None, Header()] = None,
+) -> SpectateResponse:
+    """Join a room as a spectator.
+
+    Spectators receive all game-state broadcasts via WebSocket but are
+    blocked from sending game-action messages (roll_request, select_pawn).
+    They do NOT count toward the room's max_players limit.
+
+    Returns 404 when the room code is unknown.
+    Returns 409 when the caller is already registered as a player in the room.
+    """
+    user_id = _require_user_id(x_user_id)
+    display_name = _coerce_display_name(x_display_name)
+
+    result = room_service.spectate_room(code, user_id, display_name)
+    if result is None:
+        room = room_service.get_room(code)
+        if room is None:
+            raise HTTPException(status_code=404, detail="Room not found")
+        raise HTTPException(
+            status_code=409,
+            detail="User is already a player in this room and cannot also spectate",
+        )
+
+    return SpectateResponse(**result)

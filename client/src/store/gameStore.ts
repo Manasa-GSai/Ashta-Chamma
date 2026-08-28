@@ -1,121 +1,134 @@
+/**
+ * Zustand store for Ashta Chamma game state.
+ *
+ * Holds the authoritative client-side mirror of the server game state.
+ * State is updated exclusively by applying server-sent WebSocket messages
+ * so that the client never diverges from the server.
+ *
+ * The `isSpectator` flag drives conditional UI rendering: the Roll button
+ * and pawn-selection are hidden for spectators.
+ */
+
+// NOTE: zustand is listed as a runtime dependency in the full project.
+// The type imports below will resolve once `npm install` is run.
 import { create } from 'zustand';
-import { devtools } from 'zustand/middleware';
-import {
-  GamePhase,
-  Screen,
-  type GameState,
-  type GameStore,
-  type RoomState,
-  type UserProfile,
-  type UserState,
-  type UIState,
-} from './types';
 
 // ---------------------------------------------------------------------------
-// Default initial values for each slice
+// Types
 // ---------------------------------------------------------------------------
 
-const initialGameState: GameState = {
-  pawns: [],
-  currentPlayerIndex: 0,
-  gamePhase: GamePhase.WAITING,
-  currentRoll: null,
-  legalMoveIds: [],
+export type PlayerRole = 'player' | 'spectator';
+
+export interface RoomPlayer {
+  user_id: string;
+  display_name: string;
+  role: PlayerRole;
+  player_index: number | null;
+  color: string | null;
+}
+
+export type RoomStatus = 'waiting' | 'in_progress' | 'completed' | 'abandoned';
+
+export interface RoomState {
+  code: string;
+  host_user_id: string;
+  status: RoomStatus;
+  max_players: number;
+  players: RoomPlayer[];
+}
+
+export interface GamePhase {
+  currentTurn: string | null;
+  rollResult: number | null;
+  moveOptions: Array<{ pawn_id: number; target_pos: number }>;
+}
+
+// Shape of the server's `state_update` WebSocket message
+export interface StateUpdateMessage {
+  type: 'state_update';
+  state: RoomState;
+  is_spectator?: boolean;
+}
+
+// ---------------------------------------------------------------------------
+// Store interface
+// ---------------------------------------------------------------------------
+
+interface GameStore {
+  // Room identity
+  room: RoomState | null;
+  /** True when the current user joined as a spectator. */
+  isSpectator: boolean;
+  currentUserId: string | null;
+
+  // Live game phase
+  phase: GamePhase;
+
+  // Actions
+  setCurrentUserId: (userId: string) => void;
+  setIsSpectator: (value: boolean) => void;
+  setRoom: (room: RoomState) => void;
+  setRollResult: (value: number | null) => void;
+  setCurrentTurn: (userId: string | null) => void;
+  setMoveOptions: (options: Array<{ pawn_id: number; target_pos: number }>) => void;
+
+  /**
+   * Apply a `state_update` message from the server.
+   * Updates room snapshot and spectator flag atomically.
+   */
+  applyStateUpdate: (message: StateUpdateMessage) => void;
+
+  /** Reset store to initial values (e.g. after leaving a room). */
+  reset: () => void;
+}
+
+// ---------------------------------------------------------------------------
+// Initial values
+// ---------------------------------------------------------------------------
+
+const initialPhase: GamePhase = {
+  currentTurn: null,
+  rollResult: null,
+  moveOptions: [],
 };
 
-const initialRoomState: RoomState = {
-  roomCode: null,
-  players: [],
-  roomStatus: 'WAITING',
-};
-
-const initialUserState: UserState = {
-  profile: null,
-  isAuthenticated: false,
-};
-
-const initialUIState: UIState = {
-  currentScreen: Screen.MAIN_MENU,
-  isLoading: false,
-  errorMessage: null,
-  locale: 'en',
+const initialState = {
+  room: null,
+  isSpectator: false,
+  currentUserId: null,
+  phase: initialPhase,
 };
 
 // ---------------------------------------------------------------------------
 // Store
 // ---------------------------------------------------------------------------
 
-/**
- * useGameStore is the single Zustand store for all client state.
- *
- * It is organised into four logical slices:
- *   - Game   — board positions, current player, phase, roll, legal moves
- *   - Room   — room code, participant list, room lifecycle status
- *   - User   — authenticated user profile
- *   - UI     — active screen, loading flag, error message, locale
- *
- * The devtools middleware integrates with the Redux DevTools Extension for
- * time-travel debugging during development.
- */
-export const useGameStore = create<GameStore>()(
-  devtools(
-    (set) => ({
-      // ----- Game slice -----
-      ...initialGameState,
+export const useGameStore = create<GameStore>((set) => ({
+  ...initialState,
 
-      /**
-       * Merge a partial state delta from the server into the game slice.
-       * Only fields present in `delta` are overwritten; all other state is preserved.
-       * Zustand performs a shallow top-level merge, so this is always immutable.
-       */
-      updateGameState: (delta: Partial<GameState>) =>
-        set(delta as Partial<GameStore>, false, 'game/updateGameState'),
+  setCurrentUserId: (currentUserId: string) => set({ currentUserId }),
 
-      // ----- Room slice -----
-      ...initialRoomState,
+  setIsSpectator: (isSpectator: boolean) => set({ isSpectator }),
 
-      /**
-       * Replace or merge room metadata received from the server (e.g. after a
-       * join response or a player_joined WebSocket event).
-       */
-      setRoomState: (room: Partial<RoomState>) =>
-        set(room as Partial<GameStore>, false, 'room/setRoomState'),
+  setRoom: (room: RoomState) => set({ room }),
 
-      // ----- User slice -----
-      ...initialUserState,
+  setRollResult: (rollResult: number | null) =>
+    set((prev) => ({ phase: { ...prev.phase, rollResult } })),
 
-      /**
-       * Set the authenticated user's profile.
-       * Passing null clears the profile and marks the user as unauthenticated,
-       * which is used on logout or JWT expiry.
-       */
-      setUser: (profile: UserProfile | null) =>
-        set(
-          { profile, isAuthenticated: profile !== null },
-          false,
-          'user/setUser',
-        ),
+  setCurrentTurn: (currentTurn: string | null) =>
+    set((prev) => ({ phase: { ...prev.phase, currentTurn } })),
 
-      // ----- UI slice -----
-      ...initialUIState,
+  setMoveOptions: (moveOptions: Array<{ pawn_id: number; target_pos: number }>) =>
+    set((prev) => ({ phase: { ...prev.phase, moveOptions } })),
 
-      setCurrentScreen: (screen) =>
-        set({ currentScreen: screen }, false, 'ui/setCurrentScreen'),
+  applyStateUpdate: (message: StateUpdateMessage) =>
+    set((prev) => ({
+      room: message.state,
+      // Only update isSpectator when the server explicitly sends the flag;
+      // subsequent state_update messages after the initial one omit it.
+      isSpectator:
+        message.is_spectator !== undefined ? message.is_spectator : prev.isSpectator,
+    })),
 
-      setLoading: (loading: boolean) =>
-        set({ isLoading: loading }, false, 'ui/setLoading'),
-
-      /** Show an error banner — typically triggered by a server error message. */
-      setError: (message: string) =>
-        set({ errorMessage: message }, false, 'ui/setError'),
-
-      /** Dismiss the error banner once the user acknowledges it. */
-      clearError: () =>
-        set({ errorMessage: null }, false, 'ui/clearError'),
-
-      setLocale: (locale: string) =>
-        set({ locale }, false, 'ui/setLocale'),
-    }),
-    { name: 'AshtaChammaStore' },
-  ),
-);
+  reset: () => set({ ...initialState, phase: { ...initialPhase } }),
+}));
