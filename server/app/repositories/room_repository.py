@@ -1,129 +1,102 @@
-"""Room repository: all DB access for rooms, players, and audit logs.
+"""Room repository — Protocol interface and SQLAlchemy implementation.
 
-Contains zero business logic — only parameterised queries and CRUD
-operations, per the layered architecture convention.
+Services depend on RoomRepositoryProtocol, not on SqlRoomRepository.
+This keeps the service layer fully testable with simple in-memory fakes.
 """
 
 from __future__ import annotations
 
 import uuid
+from datetime import datetime
+from typing import Any, Protocol, runtime_checkable
 
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm import selectinload
 
-from app.models.room import AiPersona, AuditLog, Room, RoomPlayer, User
+from app.models.enums import RoomStatus
+from app.models.tables import AuditLog, Room, RoomPlayer
 
 
-class RoomRepository:
-    """Database access object for room-related tables."""
+# ---------------------------------------------------------------------------
+# Protocol — the interface the service layer programs against
+# ---------------------------------------------------------------------------
 
-    def __init__(self, db: AsyncSession) -> None:
-        self._db = db
 
-    # ------------------------------------------------------------------
-    # Room queries
-    # ------------------------------------------------------------------
+@runtime_checkable
+class RoomRepositoryProtocol(Protocol):
+    """Data-access contract for room and audit-log operations."""
 
     async def get_room_by_code(self, code: str) -> Room | None:
-        """Fetch a room by its case-insensitive code with all players eager-loaded."""
-        result = await self._db.execute(
-            select(Room)
-            .where(Room.code == code.upper())
-            .options(
-                selectinload(Room.host),
-                selectinload(Room.players)
-                .selectinload(RoomPlayer.user),
-                selectinload(Room.players)
-                .selectinload(RoomPlayer.ai_persona),
-            )
-        )
+        """Return a Room row by its short code, or None."""
+        ...
+
+    async def get_room_players(self, room_id: uuid.UUID) -> list[RoomPlayer]:
+        """Return all RoomPlayer rows for the given room."""
+        ...
+
+    async def update_room_started(
+        self, room_id: uuid.UUID, started_at: datetime
+    ) -> None:
+        """Mark the room as 'playing' and record its start timestamp."""
+        ...
+
+    async def create_audit_log(
+        self,
+        actor_id: str | None,
+        action: str,
+        entity_type: str,
+        entity_id: str,
+        metadata: dict[str, Any],
+    ) -> None:
+        """Append an audit log entry."""
+        ...
+
+
+# ---------------------------------------------------------------------------
+# SQLAlchemy implementation
+# ---------------------------------------------------------------------------
+
+
+class SqlRoomRepository:
+    """Concrete room repository backed by an async SQLAlchemy session."""
+
+    def __init__(self, session: AsyncSession) -> None:
+        self._session = session
+
+    async def get_room_by_code(self, code: str) -> Room | None:
+        result = await self._session.execute(select(Room).where(Room.code == code))
         return result.scalar_one_or_none()
 
-    async def code_exists(self, code: str) -> bool:
-        """Return True if a room with the given code already exists."""
-        result = await self._db.execute(
-            select(Room.id).where(Room.code == code.upper())
+    async def get_room_players(self, room_id: uuid.UUID) -> list[RoomPlayer]:
+        result = await self._session.execute(
+            select(RoomPlayer).where(RoomPlayer.room_id == room_id)
         )
-        return result.scalar_one_or_none() is not None
+        return list(result.scalars().all())
 
-    async def create_room(self, room: Room) -> Room:
-        """Persist a new Room row and flush to populate server-generated fields."""
-        self._db.add(room)
-        await self._db.flush()
-        return room
-
-    # ------------------------------------------------------------------
-    # Player queries
-    # ------------------------------------------------------------------
-
-    async def add_room_player(self, player: RoomPlayer) -> RoomPlayer:
-        """Persist a new RoomPlayer row."""
-        self._db.add(player)
-        await self._db.flush()
-        return player
-
-    async def get_room_player(
-        self, room_id: uuid.UUID, user_id: uuid.UUID
-    ) -> RoomPlayer | None:
-        """Return the RoomPlayer entry for a specific user in a room, or None."""
-        result = await self._db.execute(
-            select(RoomPlayer).where(
-                RoomPlayer.room_id == room_id,
-                RoomPlayer.user_id == user_id,
-            )
+    async def update_room_started(
+        self, room_id: uuid.UUID, started_at: datetime
+    ) -> None:
+        await self._session.execute(
+            update(Room)
+            .where(Room.id == room_id)
+            .values(status=RoomStatus.PLAYING.value, started_at=started_at)
         )
-        return result.scalar_one_or_none()
+        await self._session.flush()
 
-    async def remove_room_player(
-        self, room_id: uuid.UUID, user_id: uuid.UUID
-    ) -> bool:
-        """Delete a player entry; returns True if a row was found and deleted."""
-        player = await self.get_room_player(room_id, user_id)
-        if player is None:
-            return False
-        await self._db.delete(player)
-        await self._db.flush()
-        return True
-
-    # ------------------------------------------------------------------
-    # AI Persona queries
-    # ------------------------------------------------------------------
-
-    async def get_ai_persona(self, persona_id: int) -> AiPersona | None:
-        """Return an active AI persona by ID, or None if not found/inactive."""
-        result = await self._db.execute(
-            select(AiPersona).where(
-                AiPersona.id == persona_id,
-                AiPersona.is_active.is_(True),
-            )
+    async def create_audit_log(
+        self,
+        actor_id: str | None,
+        action: str,
+        entity_type: str,
+        entity_id: str,
+        metadata: dict[str, Any],
+    ) -> None:
+        log = AuditLog(
+            actor_id=actor_id,
+            action=action,
+            entity_type=entity_type,
+            entity_id=entity_id,
+            metadata=metadata,
         )
-        return result.scalar_one_or_none()
-
-    # ------------------------------------------------------------------
-    # User queries
-    # ------------------------------------------------------------------
-
-    async def get_user_by_id(self, user_id: uuid.UUID) -> User | None:
-        """Return a user record by primary key."""
-        result = await self._db.execute(select(User).where(User.id == user_id))
-        return result.scalar_one_or_none()
-
-    # ------------------------------------------------------------------
-    # Audit log
-    # ------------------------------------------------------------------
-
-    async def create_audit_log(self, log: AuditLog) -> None:
-        """Persist an audit log entry."""
-        self._db.add(log)
-        await self._db.flush()
-
-    # ------------------------------------------------------------------
-    # Session management helpers
-    # ------------------------------------------------------------------
-
-    async def commit(self) -> None:
-        await self._db.commit()
-
-    async def refresh(self, obj: object) -> None:
-        await self._db.refresh(obj)  # type: ignore[arg-type]
+        self._session.add(log)
+        await self._session.flush()

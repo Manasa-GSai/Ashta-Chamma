@@ -1,1 +1,1 @@
-"""FastAPI route handlers (thin controllers)."""
+"""FastAPI route handlers."""

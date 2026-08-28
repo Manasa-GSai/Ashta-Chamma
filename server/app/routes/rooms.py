@@ -1,140 +1,98 @@
-"""REST endpoints for room lifecycle: create, read, join, leave.
+"""REST API routes for room management.
 
-Route handlers are intentionally thin: they parse the request, delegate to
-RoomService, and map domain exceptions to HTTP status codes.
+Current endpoints
+-----------------
+POST /api/rooms/{code}/start
+    Start the game session for a room. Host-only. Requires ≥ 2 players.
+    Returns the initial game state snapshot.
+
+Authentication
+--------------
+The ``Authorization: Bearer <token>`` header is required. In production
+the token is a Clerk JWT validated by auth middleware. For this scope the
+bearer token value is used directly as the user identifier; full JWT
+validation middleware will be wired in a dedicated auth WO.
+
+Dependency injection
+--------------------
+``_get_game_service`` raises ``NotImplementedError`` by default and must
+be overridden via ``app.dependency_overrides`` at startup (or in tests).
+This avoids hidden coupling to a concrete DB or Redis instance.
 """
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Annotated, Any
 
-from fastapi import APIRouter, Depends, HTTPException, status
-from sqlalchemy.ext.asyncio import AsyncSession
+from fastapi import APIRouter, Depends, Header, HTTPException
 
-from app.core.auth import CurrentUser, get_current_user
-from app.core.database import get_db_session
-from app.core.redis_client import get_redis
-from app.repositories.room_repository import RoomRepository
-from app.schemas.room import CreateRoomRequest, CreateRoomResponse, JoinResponse, RoomResponse
-from app.services.room_service import (
-    AiPersonaNotFoundError,
-    PlayerNotInRoomError,
-    RoomAlreadyStartedError,
-    RoomFullError,
-    RoomNotFoundError,
-    RoomService,
-)
+from app.services.game_service import GameService, GameStartError
 
 router = APIRouter(prefix="/api/rooms", tags=["rooms"])
 
 
 # ---------------------------------------------------------------------------
-# Dependency: build RoomService with DB + Redis injected
+# Shared dependencies
 # ---------------------------------------------------------------------------
 
 
-async def get_room_service(
-    db: AsyncSession = Depends(get_db_session),
-    redis: Any = Depends(get_redis),
-) -> RoomService:
-    """Construct a RoomService with a per-request DB session and shared Redis client."""
-    repo = RoomRepository(db)
-    return RoomService(repo, redis=redis)
+async def _require_auth(
+    authorization: Annotated[str | None, Header()] = None,
+) -> str:
+    """Extract the caller's user ID from the Bearer token.
 
-
-# ---------------------------------------------------------------------------
-# Endpoints
-# ---------------------------------------------------------------------------
-
-
-@router.post("", response_model=CreateRoomResponse, status_code=status.HTTP_201_CREATED)
-async def create_room(
-    request: CreateRoomRequest,
-    current_user: CurrentUser = Depends(get_current_user),
-    service: RoomService = Depends(get_room_service),
-) -> CreateRoomResponse:
-    """Create a new game room.
-
-    The authenticated user becomes the host (player_index 0). AI personas are
-    optionally pre-filled as specified by ``ai_persona_ids``.
+    Raises 401 when the header is absent or not a Bearer token.
     """
-    try:
-        return await service.create_room(
-            request=request,
-            host_user_id=current_user.user_id,
-            host_clerk_id=current_user.clerk_id,
-            host_display_name=current_user.display_name,
-        )
-    except AiPersonaNotFoundError as exc:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
-    except ValueError as exc:
+    if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)
-        ) from exc
-
-
-@router.get("/{code}", response_model=RoomResponse)
-async def get_room(
-    code: str,
-    current_user: CurrentUser = Depends(get_current_user),
-    service: RoomService = Depends(get_room_service),
-) -> RoomResponse:
-    """Return room details including player list and available seats.
-
-    Only room members may retrieve room details (HTTP 403 otherwise).
-    """
-    try:
-        return await service.get_room(code=code, requesting_user_id=current_user.user_id)
-    except RoomNotFoundError as exc:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
-    except PermissionError as exc:
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(exc)) from exc
-
-
-@router.post("/{code}/join", response_model=JoinResponse, status_code=status.HTTP_200_OK)
-async def join_room(
-    code: str,
-    current_user: CurrentUser = Depends(get_current_user),
-    service: RoomService = Depends(get_room_service),
-) -> JoinResponse:
-    """Join an existing room.
-
-    Returns the caller's ``player_index`` and assigned ``color``.  HTTP 409
-    if the room is full.
-    """
-    try:
-        return await service.join_room(
-            code=code,
-            user_id=current_user.user_id,
-            clerk_id=current_user.clerk_id,
-            display_name=current_user.display_name,
+            status_code=401,
+            detail="Missing or invalid Authorization header.",
         )
-    except RoomNotFoundError as exc:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
-    except RoomFullError as exc:
-        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
-    except RoomAlreadyStartedError as exc:
-        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+    return authorization.removeprefix("Bearer ").strip()
 
 
-@router.delete("/{code}/leave", status_code=status.HTTP_204_NO_CONTENT)
-async def leave_room(
+async def _get_game_service() -> GameService:
+    """Dependency placeholder — must be overridden before the server starts.
+
+    In production this dependency is wired in the FastAPI lifespan to a
+    ``GameService`` built with real repository and Redis instances.
+    In tests it is replaced via ``app.dependency_overrides``.
+    """
+    raise NotImplementedError(
+        "_get_game_service must be overridden with a real or mock provider."
+    )
+
+
+# ---------------------------------------------------------------------------
+# Routes
+# ---------------------------------------------------------------------------
+
+
+@router.post("/{code}/start", status_code=200)
+async def start_game(
     code: str,
-    current_user: CurrentUser = Depends(get_current_user),
-    service: RoomService = Depends(get_room_service),
-) -> None:
-    """Leave a room.  Returns HTTP 204 on success.
+    current_user_id: Annotated[str, Depends(_require_auth)],
+    game_service: Annotated[GameService, Depends(_get_game_service)],
+) -> dict[str, Any]:
+    """Start the game for room *code*.
 
-    If the caller is the host, the next human player is promoted to host.
-    If no humans remain, the room is marked abandoned.
+    Only the room host may call this endpoint. At least 2 players must be
+    present. Returns the initial game state snapshot for broadcasting.
+
+    Status codes:
+        200: Game started successfully.
+        400: Fewer than 2 players in the room.
+        401: Missing or invalid Authorization header.
+        403: Caller is not the room host.
+        404: Room not found.
+        409: Game is already in progress.
     """
     try:
-        await service.leave_room(
-            code=code,
-            user_id=current_user.user_id,
-            clerk_id=current_user.clerk_id,
+        snapshot = await game_service.start_game(
+            room_code=code,
+            requester_id=current_user_id,
         )
-    except RoomNotFoundError as exc:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
-    except PlayerNotInRoomError as exc:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+    except GameStartError as exc:
+        raise HTTPException(status_code=exc.http_status, detail=str(exc)) from exc
+
+    return snapshot
