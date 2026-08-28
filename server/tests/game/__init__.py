@@ -1,1 +1,1 @@
-"""Tests for the server-side game logic package (app.game)."""
+"""Game-rule characterization test package."""
