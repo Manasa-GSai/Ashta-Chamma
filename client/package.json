@@ -13,10 +13,12 @@
     "format:check": "prettier --check ."
   },
   "dependencies": {
+    "@sentry/react": "^8.0.0",
     "react": "^18.3.1",
     "react-dom": "^18.3.1"
   },
   "devDependencies": {
+    "@sentry/vite-plugin": "^2.0.0",
     "@eslint/js": "^9.15.0",
     "@types/react": "^18.3.12",
     "@types/react-dom": "^18.3.1",

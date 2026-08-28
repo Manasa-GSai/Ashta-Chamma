@@ -1,0 +1,115 @@
+name: Deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Backend — lint, type-check, test
+  # ---------------------------------------------------------------------------
+  test-backend:
+    name: Backend tests
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: server
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Poetry
+        run: pip install poetry
+
+      - name: Install dependencies
+        run: poetry install --no-interaction
+
+      - name: Lint with Ruff
+        run: poetry run ruff check .
+
+      - name: Type-check with Mypy
+        run: poetry run mypy app/
+
+      - name: Run tests
+        run: poetry run pytest --tb=short
+
+  # ---------------------------------------------------------------------------
+  # Frontend — lint, build, and upload source maps to Sentry
+  # ---------------------------------------------------------------------------
+  build-frontend:
+    name: Frontend build + Sentry source map upload
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: client
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: client/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Build — includes Sentry source map upload
+        # SENTRY_AUTH_TOKEN, SENTRY_ORG, and SENTRY_PROJECT are required for
+        # source map upload. The Sentry Vite plugin uploads the .map files and
+        # then removes them from dist/ so they are never deployed publicly.
+        env:
+          VITE_SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
+          SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN }}
+          SENTRY_ORG: ${{ secrets.SENTRY_ORG }}
+          SENTRY_PROJECT: ${{ secrets.SENTRY_PROJECT }}
+          CI: "true"
+        run: npm run build
+
+      - name: Upload dist artefact
+        uses: actions/upload-artifact@v4
+        with:
+          name: client-dist
+          # Source map files (.map) are deleted by the Sentry plugin above
+          # when CI=true, so the artefact contains no publicly accessible maps.
+          path: client/dist
+          retention-days: 1
+
+  # ---------------------------------------------------------------------------
+  # Deploy — requires both jobs to succeed; manual approval gate in production
+  # ---------------------------------------------------------------------------
+  deploy:
+    name: Deploy to production
+    needs: [test-backend, build-frontend]
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download frontend dist artefact
+        uses: actions/download-artifact@v4
+        with:
+          name: client-dist
+          path: client/dist
+
+      # Placeholder steps — configure once AWS infrastructure is provisioned.
+      - name: Build and push backend Docker image to ECR
+        run: |
+          echo "docker build + push to ECR — configure when ECR repository is ready"
+
+      - name: Deploy backend to ECS Fargate
+        run: |
+          echo "aws ecs update-service — configure when ECS cluster is ready"
+
+      - name: Sync frontend to S3 and invalidate CloudFront
+        run: |
+          echo "aws s3 sync + cloudfront invalidation — configure when CDN is ready"
