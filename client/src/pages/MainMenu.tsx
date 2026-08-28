@@ -1,115 +1,129 @@
-import { useClerk } from '@clerk/clerk-react';
-import { useTranslation } from 'react-i18next';
-import { useNavigate } from 'react-router-dom';
+import { useRef } from 'react';
+import type { CSSProperties, MouseEvent } from 'react';
 
-const styles = {
-  container: {
-    display: 'flex',
-    flexDirection: 'column' as const,
-    alignItems: 'center',
-    justifyContent: 'center',
-    minHeight: '100vh',
-    backgroundColor: '#1a0a00',
-    color: '#f5e6c8',
-    fontFamily: "'Georgia', serif",
-    padding: '1rem',
-  },
-  title: {
-    fontSize: 'clamp(2.5rem, 8vw, 5rem)',
-    fontWeight: 'bold',
-    marginBottom: '0.5rem',
-    textAlign: 'center' as const,
-    color: '#f5c842',
-    textShadow: '0 2px 8px rgba(245, 200, 66, 0.4)',
-  },
-  subtitle: {
-    fontSize: 'clamp(0.9rem, 2.5vw, 1.2rem)',
-    marginBottom: '3rem',
-    opacity: 0.7,
-    textAlign: 'center' as const,
-  },
-  nav: {
-    display: 'flex',
-    flexDirection: 'column' as const,
-    gap: '1rem',
-    width: '100%',
-    maxWidth: '280px',
-  },
-  button: {
-    padding: '0.85rem 2rem',
-    fontSize: '1.1rem',
-    fontWeight: '600',
-    border: '2px solid #f5c842',
-    borderRadius: '8px',
-    cursor: 'pointer',
-    transition: 'background-color 0.2s, color 0.2s',
-    width: '100%',
-  },
-  primaryButton: {
-    backgroundColor: '#f5c842',
-    color: '#1a0a00',
-  },
-  secondaryButton: {
-    backgroundColor: 'transparent',
-    color: '#f5c842',
-  },
-  signOutButton: {
-    backgroundColor: 'transparent',
-    color: '#aaa',
-    borderColor: '#555',
-    fontSize: '0.95rem',
-  },
-} as const;
+export interface MainMenuProps {
+  onNewGame: () => void;
+  onJoinGame: () => void;
+  onSettings: () => void;
+}
 
-export const MainMenu = (): JSX.Element => {
-  const { t } = useTranslation();
-  const navigate = useNavigate();
-  // useClerk may not be available if ClerkProvider is not configured —
-  // we guard against that with a try/catch at call time.
-  const clerk = useClerk();
+/** Inline style for the skip-to-content link when it is NOT focused. */
+const skipLinkHiddenStyle: CSSProperties = {
+  position: 'absolute',
+  left: '-9999px',
+  top: 'auto',
+  width: '1px',
+  height: '1px',
+  overflow: 'hidden',
+};
 
-  const handlePlay = (): void => {
-    void navigate('/lobby');
+/** Inline style for the skip-to-content link when it IS focused. */
+const skipLinkVisibleStyle: CSSProperties = {
+  position: 'absolute',
+  left: 0,
+  top: 0,
+  width: 'auto',
+  height: 'auto',
+  overflow: 'visible',
+  zIndex: 9999,
+  padding: '8px 16px',
+  backgroundColor: '#000',
+  color: '#fff',          // 21:1 contrast — exceeds WCAG AA 4.5:1
+  textDecoration: 'none',
+  fontSize: '1rem',
+};
+
+/**
+ * Main menu page with full keyboard navigation and ARIA accessibility.
+ *
+ * Includes a skip-to-main-content link that is visually hidden until focused
+ * by a keyboard user (WCAG 2.4.1 Bypass Blocks).
+ *
+ * All interactive elements are reachable via Tab in logical document order,
+ * and have descriptive aria-label attributes so icon-only or ambiguous labels
+ * are self-explanatory to screen reader users.
+ */
+export const MainMenu = ({
+  onNewGame,
+  onJoinGame,
+  onSettings,
+}: MainMenuProps): JSX.Element => {
+  const mainContentRef = useRef<HTMLElement>(null);
+  const skipLinkRef = useRef<HTMLAnchorElement>(null);
+
+  const handleSkipToContent = (
+    event: MouseEvent<HTMLAnchorElement>,
+  ) => {
+    event.preventDefault();
+    if (mainContentRef.current) {
+      mainContentRef.current.focus();
+    }
   };
 
-  const handleRules = (): void => {
-    void navigate('/rules');
+  const handleSkipLinkFocus = () => {
+    if (skipLinkRef.current) {
+      Object.assign(skipLinkRef.current.style, skipLinkVisibleStyle);
+    }
   };
 
-  const handleSignOut = (): void => {
-    void clerk.signOut();
+  const handleSkipLinkBlur = () => {
+    if (skipLinkRef.current) {
+      Object.assign(skipLinkRef.current.style, skipLinkHiddenStyle);
+    }
   };
 
   return (
-    <main style={styles.container}>
-      <h1 style={styles.title}>{t('main_menu.title')}</h1>
-      <p style={styles.subtitle}>{t('main_menu.subtitle')}</p>
+    <>
+      {/*
+       * Skip-to-content link (WCAG 2.4.1).
+       * Visually hidden at rest; appears on keyboard focus so keyboard-only
+       * users can skip repetitive navigation and jump directly to main content.
+       */}
+      <a
+        ref={skipLinkRef}
+        href="#main-content"
+        style={skipLinkHiddenStyle}
+        onFocus={handleSkipLinkFocus}
+        onBlur={handleSkipLinkBlur}
+        onClick={handleSkipToContent}
+      >
+        Skip to main content
+      </a>
 
-      <nav aria-label="Main navigation" style={styles.nav}>
-        <button
-          style={{ ...styles.button, ...styles.primaryButton }}
-          onClick={handlePlay}
-          type="button"
-        >
-          {t('main_menu.play')}
-        </button>
+      <main
+        id="main-content"
+        ref={mainContentRef}
+        tabIndex={-1}
+        aria-label="Ashta Chamma main menu"
+      >
+        <h1>Ashta Chamma 3D</h1>
 
-        <button
-          style={{ ...styles.button, ...styles.secondaryButton }}
-          onClick={handleRules}
-          type="button"
-        >
-          {t('main_menu.rules')}
-        </button>
+        <nav aria-label="Main menu navigation">
+          <button
+            type="button"
+            onClick={onNewGame}
+            aria-label="Start a new game"
+          >
+            New Game
+          </button>
 
-        <button
-          style={{ ...styles.button, ...styles.signOutButton }}
-          onClick={handleSignOut}
-          type="button"
-        >
-          {t('main_menu.sign_out')}
-        </button>
-      </nav>
-    </main>
+          <button
+            type="button"
+            onClick={onJoinGame}
+            aria-label="Join an existing game"
+          >
+            Join Game
+          </button>
+
+          <button
+            type="button"
+            onClick={onSettings}
+            aria-label="Open settings"
+          >
+            Settings
+          </button>
+        </nav>
+      </main>
+    </>
   );
 };

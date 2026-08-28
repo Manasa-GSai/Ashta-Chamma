@@ -1,409 +1,196 @@
-import { type FormEvent, useEffect, useState } from 'react';
-import { useTranslation } from 'react-i18next';
-import { useNavigate } from 'react-router-dom';
-import { api } from '../api/client';
-import { useGameStore } from '../store/gameStore';
+import { useState, useRef } from 'react';
+import type { FormEvent, KeyboardEvent } from 'react';
 
-interface AiPersona {
+export interface LobbyPlayer {
   id: string;
   name: string;
-  difficulty_level: 'easy' | 'medium' | 'hard' | 'expert';
-}
-
-interface CreateRoomResponse {
-  room_id: string;
-  code: string;
-}
-
-interface JoinRoomResponse {
-  player_index: number;
   color: string;
+  isReady: boolean;
+  isHost: boolean;
 }
 
-const ROOM_CODE_REGEX = /^[A-Za-z0-9]{6}$/;
+export interface LobbyProps {
+  /** Active room code; undefined if no room has been joined/created yet. */
+  roomCode?: string;
+  players: LobbyPlayer[];
+  isHost: boolean;
+  isReady: boolean;
+  /** Whether all players are ready and game can start (host only). */
+  canStart: boolean;
+  onCreateRoom: () => void;
+  onJoinRoom: (code: string) => void;
+  onToggleReady: () => void;
+  onStartGame: () => void;
+  onLeave: () => void;
+}
 
-const styles = {
-  container: {
-    minHeight: '100vh',
-    backgroundColor: '#1a0a00',
-    color: '#f5e6c8',
-    fontFamily: "'Georgia', serif",
-    padding: '2rem 1rem',
-  },
-  header: {
-    display: 'flex',
-    alignItems: 'center',
-    gap: '1rem',
-    marginBottom: '2rem',
-  },
-  title: {
-    fontSize: '2rem',
-    color: '#f5c842',
-    margin: 0,
-  },
-  backButton: {
-    background: 'transparent',
-    border: '1px solid #555',
-    color: '#aaa',
-    padding: '0.4rem 1rem',
-    borderRadius: '6px',
-    cursor: 'pointer',
-    fontSize: '0.9rem',
-  },
-  grid: {
-    display: 'grid',
-    gridTemplateColumns: 'repeat(auto-fit, minmax(300px, 1fr))',
-    gap: '2rem',
-    maxWidth: '900px',
-    margin: '0 auto',
-  },
-  card: {
-    backgroundColor: '#2a1200',
-    border: '1px solid #4a2800',
-    borderRadius: '12px',
-    padding: '1.5rem',
-  },
-  cardTitle: {
-    fontSize: '1.4rem',
-    color: '#f5c842',
-    marginTop: 0,
-    marginBottom: '1.5rem',
-  },
-  fieldset: {
-    border: '1px solid #4a2800',
-    borderRadius: '8px',
-    padding: '0.75rem 1rem',
-    marginBottom: '1rem',
-  },
-  legend: {
-    color: '#c8a86a',
-    fontSize: '0.9rem',
-    padding: '0 0.25rem',
-  },
-  label: {
-    display: 'block',
-    marginBottom: '0.5rem',
-    color: '#c8a86a',
-    fontSize: '0.9rem',
-  },
-  select: {
-    width: '100%',
-    padding: '0.5rem',
-    backgroundColor: '#1a0a00',
-    border: '1px solid #4a2800',
-    borderRadius: '6px',
-    color: '#f5e6c8',
-    fontSize: '1rem',
-  },
-  input: {
-    width: '100%',
-    padding: '0.5rem',
-    backgroundColor: '#1a0a00',
-    border: '1px solid #4a2800',
-    borderRadius: '6px',
-    color: '#f5e6c8',
-    fontSize: '1rem',
-    boxSizing: 'border-box' as const,
-  },
-  inputError: {
-    borderColor: '#e05555',
-  },
-  errorText: {
-    color: '#e05555',
-    fontSize: '0.85rem',
-    marginTop: '0.25rem',
-    display: 'block',
-  },
-  submitButton: {
-    width: '100%',
-    padding: '0.75rem',
-    backgroundColor: '#f5c842',
-    color: '#1a0a00',
-    border: 'none',
-    borderRadius: '8px',
-    fontSize: '1rem',
-    fontWeight: '600',
-    cursor: 'pointer',
-    marginTop: '1rem',
-  },
-  submitButtonDisabled: {
-    opacity: 0.6,
-    cursor: 'not-allowed',
-  },
-  checkboxRow: {
-    display: 'flex',
-    alignItems: 'center',
-    gap: '0.5rem',
-    marginBottom: '0.4rem',
-  },
-  checkboxLabel: {
-    color: '#f5e6c8',
-    fontSize: '0.95rem',
-    textTransform: 'capitalize' as const,
-  },
-  personaError: {
-    color: '#e05555',
-    fontSize: '0.85rem',
-  },
-  personaLoading: {
-    color: '#888',
-    fontSize: '0.85rem',
-  },
-} as const;
+/**
+ * Lobby page with keyboard-accessible form inputs, explicit label associations,
+ * and ARIA roles/labels on all custom interactive elements.
+ *
+ * Form inputs follow WCAG 1.3.1 (Info and Relationships) by associating every
+ * input with a <label> via htmlFor/id.  The Submit button is disabled (with
+ * aria-disabled) when no room code has been entered, giving screen reader users
+ * advance notice that the action is unavailable.
+ */
+export const Lobby = ({
+  roomCode,
+  players,
+  isHost,
+  isReady,
+  canStart,
+  onCreateRoom,
+  onJoinRoom,
+  onToggleReady,
+  onStartGame,
+  onLeave,
+}: LobbyProps): JSX.Element => {
+  const [joinCodeInput, setJoinCodeInput] = useState<string>('');
+  const joinInputRef = useRef<HTMLInputElement>(null);
 
-export const Lobby = (): JSX.Element => {
-  const { t } = useTranslation();
-  const navigate = useNavigate();
-  const { setRoomCode } = useGameStore();
+  const handleJoinSubmit = (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    const trimmed = joinCodeInput.trim().toUpperCase();
+    if (trimmed) {
+      onJoinRoom(trimmed);
+    }
+  };
 
-  // Create Room state
-  const [maxPlayers, setMaxPlayers] = useState<number>(4);
-  const [selectedPersonas, setSelectedPersonas] = useState<string[]>([]);
-  const [personas, setPersonas] = useState<AiPersona[]>([]);
-  const [personasLoading, setPersonasLoading] = useState<boolean>(true);
-  const [personasError, setPersonasError] = useState<string | null>(null);
-  const [isCreating, setIsCreating] = useState<boolean>(false);
-  const [createError, setCreateError] = useState<string | null>(null);
-
-  // Join Room state
-  const [joinCode, setJoinCode] = useState<string>('');
-  const [codeError, setCodeError] = useState<string | null>(null);
-  const [isJoining, setIsJoining] = useState<boolean>(false);
-  const [joinError, setJoinError] = useState<string | null>(null);
-
-  useEffect(() => {
-    const fetchPersonas = async (): Promise<void> => {
-      try {
-        setPersonasLoading(true);
-        setPersonasError(null);
-        const data = await api.get<AiPersona[]>('/api/ai-personas');
-        setPersonas(data);
-      } catch {
-        setPersonasError(t('common.error'));
-      } finally {
-        setPersonasLoading(false);
+  const handleJoinInputKeyDown = (
+    event: KeyboardEvent<HTMLInputElement>,
+  ) => {
+    // Enter submits the form — handled by native form submit; Space is a
+    // normal character in a text field so we do not override it here.
+    if (event.key === 'Enter') {
+      const trimmed = joinCodeInput.trim().toUpperCase();
+      if (trimmed) {
+        onJoinRoom(trimmed);
       }
-    };
-
-    void fetchPersonas();
-  }, [t]);
-
-  const handlePersonaToggle = (id: string): void => {
-    setSelectedPersonas((prev) =>
-      prev.includes(id) ? prev.filter((p) => p !== id) : [...prev, id],
-    );
-  };
-
-  const handleCreate = async (e: FormEvent<HTMLFormElement>): Promise<void> => {
-    e.preventDefault();
-    setCreateError(null);
-    setIsCreating(true);
-
-    try {
-      const body: { max_players: number; ai_personas?: string[] } = {
-        max_players: maxPlayers,
-      };
-      if (selectedPersonas.length > 0) {
-        body.ai_personas = selectedPersonas;
-      }
-
-      const data = await api.post<CreateRoomResponse>('/api/rooms', body);
-      setRoomCode(data.code);
-      void navigate(`/game/${data.code}`);
-    } catch {
-      setCreateError(t('common.error'));
-    } finally {
-      setIsCreating(false);
-    }
-  };
-
-  const validateCode = (value: string): boolean => {
-    if (!ROOM_CODE_REGEX.test(value)) {
-      setCodeError(t('lobby.join.code_error'));
-      return false;
-    }
-    setCodeError(null);
-    return true;
-  };
-
-  const handleJoinCodeChange = (value: string): void => {
-    const upper = value.toUpperCase();
-    setJoinCode(upper);
-    if (upper.length > 0) {
-      validateCode(upper);
-    } else {
-      setCodeError(null);
-    }
-  };
-
-  const handleJoin = async (e: FormEvent<HTMLFormElement>): Promise<void> => {
-    e.preventDefault();
-    setJoinError(null);
-
-    if (!validateCode(joinCode)) {
-      return;
-    }
-
-    setIsJoining(true);
-
-    try {
-      await api.post<JoinRoomResponse>(
-        `/api/rooms/${joinCode}/join`,
-        {},
-      );
-      setRoomCode(joinCode);
-      void navigate(`/game/${joinCode}`);
-    } catch {
-      setJoinError(t('common.error'));
-    } finally {
-      setIsJoining(false);
     }
   };
 
   return (
-    <div style={styles.container}>
-      <header style={styles.header}>
-        <button
-          style={styles.backButton}
-          onClick={() => void navigate('/')}
-          type="button"
-          aria-label={t('lobby.back')}
-        >
-          ← {t('lobby.back')}
-        </button>
-        <h1 style={styles.title}>{t('lobby.title')}</h1>
-      </header>
+    <main aria-label="Game lobby">
+      <h1>Game Lobby</h1>
 
-      <div style={styles.grid}>
-        {/* Create Room */}
-        <section style={styles.card} aria-labelledby="create-room-heading">
-          <h2 id="create-room-heading" style={styles.cardTitle}>
-            {t('lobby.create.title')}
-          </h2>
+      {roomCode === undefined ? (
+        /* Pre-room section: create or join */
+        <section aria-label="Room options">
+          <button
+            type="button"
+            onClick={onCreateRoom}
+            aria-label="Create a new game room"
+          >
+            Create Room
+          </button>
 
-          <form onSubmit={(e) => void handleCreate(e)} noValidate>
-            <label style={styles.label} htmlFor="max-players">
-              {t('lobby.create.max_players')}
-            </label>
-            <select
-              id="max-players"
-              style={styles.select}
-              value={maxPlayers}
-              onChange={(e) => setMaxPlayers(Number(e.target.value))}
-            >
-              <option value={2}>2</option>
-              <option value={3}>3</option>
-              <option value={4}>4</option>
-            </select>
-
-            <fieldset style={{ ...styles.fieldset, marginTop: '1rem' }}>
-              <legend style={styles.legend}>
-                {t('lobby.create.ai_personas')}
-              </legend>
-
-              {personasLoading && (
-                <p style={styles.personaLoading}>{t('common.loading')}</p>
-              )}
-
-              {personasError !== null && !personasLoading && (
-                <p style={styles.personaError}>{personasError}</p>
-              )}
-
-              {!personasLoading &&
-                personasError === null &&
-                personas.map((persona) => (
-                  <div key={persona.id} style={styles.checkboxRow}>
-                    <input
-                      type="checkbox"
-                      id={`persona-${persona.id}`}
-                      checked={selectedPersonas.includes(persona.id)}
-                      onChange={() => handlePersonaToggle(persona.id)}
-                    />
-                    <label
-                      htmlFor={`persona-${persona.id}`}
-                      style={styles.checkboxLabel}
-                    >
-                      {persona.name} ({persona.difficulty_level})
-                    </label>
-                  </div>
-                ))}
-
-              {!personasLoading &&
-                personasError === null &&
-                personas.length === 0 && (
-                  <p style={styles.personaLoading}>No AI personas available</p>
-                )}
-            </fieldset>
-
-            {createError !== null && (
-              <p role="alert" style={styles.errorText}>
-                {createError}
-              </p>
-            )}
+          <form
+            onSubmit={handleJoinSubmit}
+            aria-label="Join an existing room by code"
+          >
+            <div>
+              {/* Explicit label association via htmlFor/id (WCAG 1.3.1) */}
+              <label htmlFor="room-code-input">Room Code</label>
+              <input
+                id="room-code-input"
+                ref={joinInputRef}
+                type="text"
+                value={joinCodeInput}
+                onChange={(e) =>
+                  setJoinCodeInput(e.target.value.toUpperCase())
+                }
+                onKeyDown={handleJoinInputKeyDown}
+                placeholder="e.g. ABC123"
+                aria-label="Enter 6-character room code"
+                aria-required="true"
+                maxLength={6}
+                autoComplete="off"
+                spellCheck={false}
+              />
+            </div>
 
             <button
               type="submit"
-              style={{
-                ...styles.submitButton,
-                ...(isCreating ? styles.submitButtonDisabled : {}),
-              }}
-              disabled={isCreating}
+              aria-label="Join the room with the entered code"
+              aria-disabled={!joinCodeInput.trim()}
+              disabled={!joinCodeInput.trim()}
             >
-              {isCreating ? t('lobby.create.loading') : t('lobby.create.submit')}
+              Join Room
             </button>
           </form>
         </section>
+      ) : (
+        /* In-room section: player list and lobby controls */
+        <section aria-label="Room information">
+          <p>
+            Room Code:{' '}
+            <strong aria-label={`Room code: ${roomCode}`}>{roomCode}</strong>
+          </p>
 
-        {/* Join Room */}
-        <section style={styles.card} aria-labelledby="join-room-heading">
-          <h2 id="join-room-heading" style={styles.cardTitle}>
-            {t('lobby.join.title')}
-          </h2>
+          <section aria-label="Players in lobby">
+            <h2>Players</h2>
+            <ul>
+              {players.map((player) => (
+                <li key={player.id}>
+                  {/*
+                   * Color alone must not convey meaning (WCAG 1.4.1).
+                   * Host/ready status is conveyed in text AND aria-label.
+                   */}
+                  <span
+                    aria-label={[
+                      player.name,
+                      player.isHost ? 'host' : null,
+                      player.isReady ? 'ready' : 'not ready',
+                    ]
+                      .filter(Boolean)
+                      .join(', ')}
+                  >
+                    {player.name}
+                    {player.isHost && ' (Host)'}
+                    {player.isReady ? ' ✓' : ' …'}
+                  </span>
+                </li>
+              ))}
+            </ul>
+          </section>
 
-          <form onSubmit={(e) => void handleJoin(e)} noValidate>
-            <label style={styles.label} htmlFor="join-code">
-              {t('lobby.join.code_label')}
-            </label>
-            <input
-              id="join-code"
-              type="text"
-              style={{
-                ...styles.input,
-                ...(codeError !== null ? styles.inputError : {}),
-              }}
-              value={joinCode}
-              onChange={(e) => handleJoinCodeChange(e.target.value)}
-              placeholder={t('lobby.join.code_placeholder')}
-              maxLength={6}
-              autoComplete="off"
-              aria-describedby={codeError !== null ? 'join-code-error' : undefined}
-              aria-invalid={codeError !== null}
-            />
-            {codeError !== null && (
-              <span id="join-code-error" role="alert" style={styles.errorText}>
-                {codeError}
-              </span>
-            )}
+          <div role="group" aria-label="Lobby actions">
+            {/* Toggle button — aria-pressed communicates current state */}
+            <button
+              type="button"
+              onClick={onToggleReady}
+              aria-label={
+                isReady
+                  ? 'Mark yourself as not ready'
+                  : 'Mark yourself as ready'
+              }
+              aria-pressed={isReady}
+            >
+              {isReady ? 'Not Ready' : 'Ready'}
+            </button>
 
-            {joinError !== null && (
-              <p role="alert" style={styles.errorText}>
-                {joinError}
-              </p>
+            {isHost && (
+              <button
+                type="button"
+                onClick={onStartGame}
+                disabled={!canStart}
+                aria-label="Start the game"
+                aria-disabled={!canStart}
+              >
+                Start Game
+              </button>
             )}
 
             <button
-              type="submit"
-              style={{
-                ...styles.submitButton,
-                ...(isJoining ? styles.submitButtonDisabled : {}),
-              }}
-              disabled={isJoining}
+              type="button"
+              onClick={onLeave}
+              aria-label="Leave the lobby and return to main menu"
             >
-              {isJoining ? t('lobby.join.loading') : t('lobby.join.submit')}
+              Leave
             </button>
-          </form>
+          </div>
         </section>
-      </div>
-    </div>
+      )}
+    </main>
   );
 };
