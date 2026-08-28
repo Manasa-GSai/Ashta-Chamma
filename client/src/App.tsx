@@ -1,6 +1,8 @@
 import { lazy, Suspense } from 'react';
 import { BrowserRouter, Route, Routes } from 'react-router-dom';
 
+// Lobby is routed via MainMenu navigation — the page-state stub was removed.
+
 /**
  * Route-level code splitting via React.lazy().
  *
@@ -47,32 +49,6 @@ const PageLoader = (): JSX.Element => (
  * co-located for easy code-splitting review.
  */
 export const App = (): JSX.Element => {
-  const [page, setPage] = useState<AppPage>('menu');
-
-  if (page === 'lobby') {
-    return (
-      <Lobby
-        players={[]}
-        isHost={true}
-        isReady={false}
-        canStart={false}
-        onCreateRoom={() => {
-          /* room creation wired in by the game-session WO */
-        }}
-        onJoinRoom={() => {
-          /* join logic wired in by the game-session WO */
-        }}
-        onToggleReady={() => {
-          /* ready-toggle wired in by the game-session WO */
-        }}
-        onStartGame={() => {
-          /* start-game wired in by the game-session WO */
-        }}
-        onLeave={() => setPage('menu')}
-      />
-    );
-  }
-
   return (
     <BrowserRouter>
       {/*
