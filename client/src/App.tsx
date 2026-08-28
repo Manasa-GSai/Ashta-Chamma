@@ -1,41 +1,64 @@
-import { BrowserRouter, Navigate, Route, Routes } from 'react-router-dom';
-import { Game } from './pages/Game';
-import { Lobby } from './pages/Lobby';
-import { MainMenu } from './pages/MainMenu';
-import { Rules } from './pages/Rules';
+import { useState, useEffect } from 'react';
+import { Leaderboard } from './pages/Leaderboard';
+import { Profile } from './pages/Profile';
+import { t } from './lib/i18n';
+
+/**
+ * Supported client-side routes driven by the URL hash.
+ * Hash-based routing avoids a server-side catch-all while keeping
+ * the /leaderboard and /profile routes bookmarkable.
+ */
+type Route = 'home' | 'leaderboard' | 'profile';
+
+function parseRoute(hash: string): Route {
+  const path = hash.replace(/^#\/?/, '');
+  if (path === 'leaderboard') return 'leaderboard';
+  if (path === 'profile') return 'profile';
+  return 'home';
+}
 
 export const App = (): JSX.Element => {
-  const [rollTrigger, setRollTrigger] = useState(0);
-  const [rollResult, setRollResult] = useState<boolean[] | null>(null);
-  const [isRolling, setIsRolling] = useState(false);
-  const [settleSummary, setSettleSummary] = useState<string | null>(null);
+  const [route, setRoute] = useState<Route>(() => parseRoute(window.location.hash));
 
-  const handleRoll = () => {
-    // Simulate a server roll result: random mouth-up/down for each shell.
-    const result = Array.from({ length: SHELL_COUNT }, () => Math.random() > 0.5);
-    setRollResult(result);
-    setIsRolling(true);
-    setSettleSummary(null);
-    setRollTrigger((n) => n + 1);
-  };
+  useEffect(() => {
+    const handleHashChange = (): void => {
+      setRoute(parseRoute(window.location.hash));
+    };
+    window.addEventListener('hashchange', handleHashChange);
+    return () => {
+      window.removeEventListener('hashchange', handleHashChange);
+    };
+  }, []);
 
-  const handleSettled = () => {
-    setIsRolling(false);
-    if (rollResult !== null) {
-      const mouthUp = rollResult.filter(Boolean).length;
-      setSettleSummary(`Roll settled — ${mouthUp} mouth-up`);
-    }
-  };
+  // Auth tokens will be managed by Clerk in subsequent work orders.
+  // Read from localStorage as a placeholder until AuthProvider is wired.
+  const token = window.localStorage.getItem('auth_token');
+  const userId = window.localStorage.getItem('user_id');
 
   return (
-    <BrowserRouter>
-      <Routes>
-        <Route path="/" element={<MainMenu />} />
-        <Route path="/lobby" element={<Lobby />} />
-        <Route path="/rules" element={<Rules />} />
-        <Route path="/game/:code" element={<Game />} />
-        <Route path="*" element={<Navigate to="/" replace />} />
-      </Routes>
-    </BrowserRouter>
+    <div>
+      <nav aria-label="Main navigation">
+        <a href="#">{t('common.nav.home')}</a>
+        {' | '}
+        <a href="#leaderboard">{t('common.nav.leaderboard')}</a>
+        {' | '}
+        <a href="#profile">{t('common.nav.profile')}</a>
+      </nav>
+
+      {route === 'home' && (
+        <main>
+          <h1>Ashta Chamma 3D</h1>
+          <p>Monorepo scaffold initialized. Game implementation coming soon.</p>
+        </main>
+      )}
+
+      {route === 'leaderboard' && (
+        <Leaderboard currentUserId={userId} />
+      )}
+
+      {route === 'profile' && (
+        <Profile token={token} />
+      )}
+    </div>
   );
 };
