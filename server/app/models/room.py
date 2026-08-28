@@ -1,157 +1,73 @@
-"""ORM models for rooms, players, users, AI personas, and audit logs.
+"""SQLAlchemy ORM models for room and audit-log entities.
 
-Table layout follows the architecture's database schema section.
+These models map directly to the PostgreSQL tables defined in the architecture
+schema.  Alembic migrations (managed separately) must be kept in sync with any
+changes made here.
 """
 
-from __future__ import annotations
-
-import enum
 import uuid
-from datetime import datetime
-from typing import Any
+from datetime import datetime, timezone
+from enum import Enum as PyEnum
 
-from sqlalchemy import (
-    BigInteger,
-    Boolean,
-    DateTime,
-    Enum as SAEnum,
-    ForeignKey,
-    Integer,
-    String,
-)
-from sqlalchemy.dialects.postgresql import UUID
-from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
-from sqlalchemy.types import JSON
+from sqlalchemy import JSON, DateTime
+from sqlalchemy import Enum as SAEnum
+from sqlalchemy import ForeignKey, Integer, String
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
 class Base(DeclarativeBase):
-    pass
+    """Shared declarative base for all ORM models."""
 
 
-class RoomStatus(str, enum.Enum):
-    waiting = "waiting"
-    in_progress = "in_progress"
-    completed = "completed"
-    abandoned = "abandoned"
+class RoomStatus(str, PyEnum):
+    """Lifecycle states a room can be in.
 
+    ``abandoned`` is the terminal state set by the idle-cleanup task (BR-5).
+    """
 
-class DifficultyLevel(str, enum.Enum):
-    easy = "easy"
-    medium = "medium"
-    hard = "hard"
-    expert = "expert"
-
-
-class User(Base):
-    __tablename__ = "users"
-
-    id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
-    )
-    clerk_id: Mapped[str] = mapped_column(String(128), unique=True, nullable=False)
-    display_name: Mapped[str] = mapped_column(String(100), nullable=False)
-    avatar_url: Mapped[str | None] = mapped_column(String(500), nullable=True)
-    locale: Mapped[str] = mapped_column(String(10), default="en", nullable=False)
-    created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), default=datetime.utcnow, nullable=False
-    )
-
-    room_players: Mapped[list[RoomPlayer]] = relationship(
-        "RoomPlayer", back_populates="user", foreign_keys="RoomPlayer.user_id"
-    )
-    hosted_rooms: Mapped[list[Room]] = relationship("Room", back_populates="host")
-
-
-class AiPersona(Base):
-    __tablename__ = "ai_personas"
-
-    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    name: Mapped[str] = mapped_column(String(100), nullable=False)
-    difficulty_level: Mapped[DifficultyLevel] = mapped_column(
-        SAEnum(DifficultyLevel), nullable=False
-    )
-    strategy_weights: Mapped[dict[str, Any]] = mapped_column(
-        JSON, nullable=False, default=dict
-    )
-    is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
-
-    room_players: Mapped[list[RoomPlayer]] = relationship(
-        "RoomPlayer", back_populates="ai_persona"
-    )
+    WAITING = "waiting"
+    IN_PROGRESS = "in_progress"
+    COMPLETED = "completed"
+    ABANDONED = "abandoned"
 
 
 class Room(Base):
+    """Game room entity — persisted in the ``rooms`` table."""
+
     __tablename__ = "rooms"
 
-    id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
-    )
-    # 6-character alphanumeric code, case-insensitively unique (stored uppercase)
-    code: Mapped[str] = mapped_column(String(6), unique=True, nullable=False, index=True)
-    host_user_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("users.id"), nullable=False
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    code: Mapped[str] = mapped_column(String(6), unique=True, nullable=False)
+    host_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"), nullable=True
     )
     status: Mapped[RoomStatus] = mapped_column(
-        SAEnum(RoomStatus), default=RoomStatus.waiting, nullable=False
+        SAEnum(RoomStatus, name="room_status"),
+        nullable=False,
+        default=RoomStatus.WAITING,
     )
-    max_players: Mapped[int] = mapped_column(Integer, nullable=False)
+    max_players: Mapped[int] = mapped_column(Integer, default=4)
     created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), default=datetime.utcnow, nullable=False
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc),
     )
-
-    host: Mapped[User] = relationship(
-        "User", back_populates="hosted_rooms", foreign_keys=[host_user_id]
-    )
-    players: Mapped[list[RoomPlayer]] = relationship(
-        "RoomPlayer",
-        back_populates="room",
-        lazy="selectin",
-    )
-
-
-class RoomPlayer(Base):
-    __tablename__ = "room_players"
-
-    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    room_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("rooms.id"), nullable=False
-    )
-    user_id: Mapped[uuid.UUID | None] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("users.id"), nullable=True
-    )
-    ai_persona_id: Mapped[int | None] = mapped_column(
-        Integer, ForeignKey("ai_personas.id"), nullable=True
-    )
-    player_index: Mapped[int] = mapped_column(Integer, nullable=False)
-    color: Mapped[str] = mapped_column(String(20), nullable=False)
-    joined_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), default=datetime.utcnow, nullable=False
-    )
-
-    room: Mapped[Room] = relationship("Room", back_populates="players")
-    user: Mapped[User | None] = relationship(
-        "User",
-        back_populates="room_players",
-        foreign_keys=[user_id],
-        lazy="selectin",
-    )
-    ai_persona: Mapped[AiPersona | None] = relationship(
-        "AiPersona", back_populates="room_players", lazy="selectin"
-    )
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    ended_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
 class AuditLog(Base):
+    """Immutable audit trail entry — persisted in the ``audit_logs`` table."""
+
     __tablename__ = "audit_logs"
 
-    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
-    # Stores the Clerk ID of the user who performed the action
-    actor_id: Mapped[str] = mapped_column(String(128), nullable=False)
-    action: Mapped[str] = mapped_column(String(100), nullable=False)
-    entity_type: Mapped[str] = mapped_column(String(50), nullable=False)
-    entity_id: Mapped[str] = mapped_column(String(100), nullable=False)
-    metadata_: Mapped[dict[str, Any]] = mapped_column(
-        "metadata", JSON, nullable=False, default=dict
-    )
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    actor_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    action: Mapped[str] = mapped_column(String, nullable=False)
+    entity_type: Mapped[str | None] = mapped_column(String, nullable=True)
+    entity_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    # ``metadata`` stores arbitrary context (e.g. inactivity reason, timestamps).
+    metadata: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), default=datetime.utcnow, nullable=False
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc),
     )
