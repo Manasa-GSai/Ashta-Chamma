@@ -1,64 +1,35 @@
-import { useState, useEffect } from 'react';
-import { Leaderboard } from './pages/Leaderboard';
-import { Profile } from './pages/Profile';
-import { t } from './lib/i18n';
+import { I18nextProvider, useTranslation } from 'react-i18next';
+import i18n from './i18n/config';
+import { LanguageToggle } from './components/LanguageToggle';
 
 /**
- * Supported client-side routes driven by the URL hash.
- * Hash-based routing avoids a server-side catch-all while keeping
- * the /leaderboard and /profile routes bookmarkable.
+ * Inner application shell.
+ * Separated from App so that useTranslation() is called inside the
+ * I18nextProvider boundary.
  */
-type Route = 'home' | 'leaderboard' | 'profile';
-
-function parseRoute(hash: string): Route {
-  const path = hash.replace(/^#\/?/, '');
-  if (path === 'leaderboard') return 'leaderboard';
-  if (path === 'profile') return 'profile';
-  return 'home';
-}
-
-export const App = (): JSX.Element => {
-  const [route, setRoute] = useState<Route>(() => parseRoute(window.location.hash));
-
-  useEffect(() => {
-    const handleHashChange = (): void => {
-      setRoute(parseRoute(window.location.hash));
-    };
-    window.addEventListener('hashchange', handleHashChange);
-    return () => {
-      window.removeEventListener('hashchange', handleHashChange);
-    };
-  }, []);
-
-  // Auth tokens will be managed by Clerk in subsequent work orders.
-  // Read from localStorage as a placeholder until AuthProvider is wired.
-  const token = window.localStorage.getItem('auth_token');
-  const userId = window.localStorage.getItem('user_id');
+const AppContent = (): JSX.Element => {
+  const { t } = useTranslation();
 
   return (
-    <div>
-      <nav aria-label="Main navigation">
-        <a href="#">{t('common.nav.home')}</a>
-        {' | '}
-        <a href="#leaderboard">{t('common.nav.leaderboard')}</a>
-        {' | '}
-        <a href="#profile">{t('common.nav.profile')}</a>
-      </nav>
+    <main>
+      <header>
+        <LanguageToggle />
+      </header>
+      <h1>{t('menu.title')}</h1>
+      <p>{t('menu.welcome')}</p>
+    </main>
+  );
+};
 
-      {route === 'home' && (
-        <main>
-          <h1>Ashta Chamma 3D</h1>
-          <p>Monorepo scaffold initialized. Game implementation coming soon.</p>
-        </main>
-      )}
-
-      {route === 'leaderboard' && (
-        <Leaderboard currentUserId={userId} />
-      )}
-
-      {route === 'profile' && (
-        <Profile token={token} />
-      )}
-    </div>
+/**
+ * Root application component.
+ * Wraps the entire tree in I18nextProvider so every screen has access to
+ * the t() function and language-switching via LanguageToggle.
+ */
+export const App = (): JSX.Element => {
+  return (
+    <I18nextProvider i18n={i18n}>
+      <AppContent />
+    </I18nextProvider>
   );
 };
