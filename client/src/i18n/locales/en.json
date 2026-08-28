@@ -1,0 +1,71 @@
+{
+  "menu": {
+    "play": "Play",
+    "rules": "Rules",
+    "signOut": "Sign Out",
+    "title": "Ashta Chamma",
+    "welcome": "Welcome to Ashta Chamma 3D"
+  },
+  "lobby": {
+    "createRoom": "Create Room",
+    "joinRoom": "Join Room",
+    "roomCode": "Room Code",
+    "enterCode": "Enter room code",
+    "players": "Players",
+    "waiting": "Waiting for players...",
+    "startGame": "Start Game",
+    "copyCode": "Copy Code",
+    "codeCopied": "Code copied!",
+    "maxPlayers": "Max Players",
+    "roomFull": "Room is full"
+  },
+  "game": {
+    "yourTurn": "Your Turn",
+    "roll": "Roll",
+    "rolling": "Rolling...",
+    "selectPawn": "Select a pawn to move",
+    "capture": "Capture!",
+    "safe": "Safe square",
+    "win": "You win!",
+    "lose": "Game over",
+    "score": "Score",
+    "turn": "Turn",
+    "player": "Player"
+  },
+  "rules": {
+    "title": "Game Rules",
+    "rule1": "Roll 4 cowrie shells to determine your move",
+    "rule2": "A roll of 1 or 8 allows entering a new pawn onto the board",
+    "rule3": "A roll of 1, 4, or 8 grants an extra turn",
+    "rule4": "Landing on an opponent's pawn on a non-safe square captures it",
+    "rule5": "Captured pawns return to their starting base",
+    "rule6": "Safe squares protect pawns from capture",
+    "rule7": "Guide all 4 of your pawns home to win"
+  },
+  "errors": {
+    "roomFull": "This room is full",
+    "invalidCode": "Invalid room code",
+    "notYourTurn": "It is not your turn",
+    "invalidMove": "Invalid move",
+    "connectionLost": "Connection lost. Reconnecting...",
+    "generic": "Something went wrong. Please try again."
+  },
+  "common": {
+    "loading": "Loading...",
+    "back": "Back",
+    "cancel": "Cancel",
+    "confirm": "Confirm",
+    "ok": "OK",
+    "language": "Language",
+    "english": "English",
+    "telugu": "తెలుగు"
+  },
+  "leaderboard": {
+    "title": "Leaderboard",
+    "rank": "Rank",
+    "player": "Player",
+    "wins": "Wins",
+    "gamesPlayed": "Games Played",
+    "noScores": "No scores yet"
+  }
+}

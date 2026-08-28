@@ -1,74 +1,151 @@
-"""FastAPI application factory for Ashta Chamma 3D backend.
+"""Ashta Chamma 3D — FastAPI application entry point.
 
-The module exposes a single ``app`` instance that is referenced by the
-Uvicorn entrypoint: ``uvicorn app.main:app --reload``.
+This module creates and configures the FastAPI application instance, registers
+all API routers with their route tags and descriptions, and sets up OpenAPI
+documentation endpoints at /docs (Swagger UI) and /redoc (ReDoc).
 
-Routers for rooms, users, scores, and WebSocket endpoints will be mounted
-here by subsequent work orders.  For now the app wires in:
-* A health-check endpoint (``GET /api/health``).
-* Structured JSON error handlers.
-* CORS middleware.
+Concrete routers (rooms, users, scores, websocket) will be added by subsequent
+work orders and plugged in here.
 """
 
-import logging
-import os
-
-from fastapi import FastAPI, Request, status
-from fastapi.middleware.cors import CORSMiddleware
+from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 
 from app import __version__
 
-logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s %(message)s")
-logger = logging.getLogger(__name__)
-
-app = FastAPI(
-    title="Ashta Chamma 3D API",
-    version=__version__,
-    docs_url="/api/docs",
-    redoc_url="/api/redoc",
-    openapi_url="/api/openapi.json",
-)
-
 # ---------------------------------------------------------------------------
-# CORS — allow the Vite dev server and production CloudFront origin.
+# OpenAPI metadata
 # ---------------------------------------------------------------------------
+_DESCRIPTION = """
+## Ashta Chamma 3D — API
 
-_allowed_origins = [
-    o.strip()
-    for o in os.environ.get("CORS_ALLOWED_ORIGINS", "http://localhost:5173").split(",")
-    if o.strip()
+Server-authoritative backend for the 3D multiplayer Ashta Chamma board game.
+
+### Features
+
+- **Room management** — create, join, and leave game rooms.
+- **Real-time gameplay** — WebSocket connections with Redis pub/sub fan-out.
+- **Leaderboards** — global and time-windowed score rankings.
+- **User profiles** — Clerk-authenticated player profiles.
+
+### Authentication
+
+All endpoints except `/api/health` require a valid **Clerk JWT** passed as a
+Bearer token in the `Authorization` header:
+
+```
+Authorization: Bearer <clerk_jwt>
+```
+
+WebSocket connections pass the JWT as a query parameter:
+
+```
+wss://api.example.com/ws/rooms/{room_id}?token=<clerk_jwt>
+```
+
+### Real-Time Protocol
+
+In-game communication uses a JSON WebSocket protocol with a `type` discriminator
+field. See the [architecture documentation](https://github.com/Manasa-GSai/Ashta-Chamma/blob/main/docs/architecture.md)
+for the full message catalogue.
+"""
+
+_TAGS_METADATA: list[dict[str, str]] = [
+    {
+        "name": "health",
+        "description": "Service health and readiness checks.",
+    },
+    {
+        "name": "rooms",
+        "description": (
+            "Game room lifecycle operations: create a room, retrieve room details, "
+            "join or leave a room."
+        ),
+    },
+    {
+        "name": "users",
+        "description": "User profile management for authenticated players.",
+    },
+    {
+        "name": "scores",
+        "description": "Leaderboard queries and per-user score history.",
+    },
+    {
+        "name": "websocket",
+        "description": (
+            "Real-time WebSocket endpoint for in-game communication. "
+            "Clients connect and exchange JSON messages: "
+            "`roll_request`, `select_pawn`, `chat`, `ping` (client→server) and "
+            "`state_update`, `roll_result`, `move_options`, `game_over`, `pong` (server→client)."
+        ),
+    },
 ]
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=_allowed_origins,
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
 
+def create_app() -> FastAPI:
+    """Create and configure the FastAPI application.
 
-# ---------------------------------------------------------------------------
-# Global exception handlers
-# ---------------------------------------------------------------------------
-
-
-@app.exception_handler(Exception)
-async def _unhandled_exception_handler(request: Request, exc: Exception) -> JSONResponse:
-    logger.exception("Unhandled exception on %s %s", request.method, request.url.path)
-    return JSONResponse(
-        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-        content={"error": "internal_server_error"},
+    Returns a fully-configured application instance with:
+    - OpenAPI docs at /docs (Swagger UI) and /redoc (ReDoc).
+    - Health check endpoint at /api/health.
+    - Versioned API prefix /api for all REST routes.
+    """
+    app = FastAPI(
+        title="Ashta Chamma 3D",
+        description=_DESCRIPTION,
+        version=__version__,
+        openapi_tags=_TAGS_METADATA,
+        docs_url="/docs",
+        redoc_url="/redoc",
+        openapi_url="/openapi.json",
+        license_info={
+            "name": "MIT",
+            "url": "https://opensource.org/licenses/MIT",
+        },
+        contact={
+            "name": "Ashta Chamma Team",
+            "url": "https://github.com/Manasa-GSai/Ashta-Chamma",
+        },
     )
 
+    # ------------------------------------------------------------------
+    # Health check — no auth required; used by ALB and ECS health checks
+    # ------------------------------------------------------------------
+    @app.get(
+        "/api/health",
+        tags=["health"],
+        summary="Service health check",
+        description=(
+            "Returns the service status and current version. "
+            "Used by the ALB health check and ECS task health monitoring. "
+            "No authentication required."
+        ),
+        response_description="Service is healthy and accepting requests.",
+    )
+    async def health_check() -> JSONResponse:
+        """Return a simple health status payload."""
+        return JSONResponse(
+            content={"status": "ok", "version": __version__},
+            status_code=200,
+        )
 
-# ---------------------------------------------------------------------------
-# Health check
-# ---------------------------------------------------------------------------
+    # ------------------------------------------------------------------
+    # Future routers will be registered here, for example:
+    #
+    #   from app.routers.rooms import router as rooms_router
+    #   from app.routers.users import router as users_router
+    #   from app.routers.scores import router as scores_router
+    #   from app.routers.websocket import router as ws_router
+    #
+    #   app.include_router(rooms_router, prefix="/api", tags=["rooms"])
+    #   app.include_router(users_router, prefix="/api", tags=["users"])
+    #   app.include_router(scores_router, prefix="/api", tags=["scores"])
+    #   app.include_router(ws_router, tags=["websocket"])
+    # ------------------------------------------------------------------
+
+    return app
 
 
-@app.get("/api/health", tags=["ops"])
-async def health() -> dict[str, str]:
-    """Liveness probe used by the ECS ALB health check and CI smoke tests."""
-    return {"status": "ok", "version": __version__}
+# Module-level application instance consumed by Uvicorn:
+#   uvicorn app.main:app --host 0.0.0.0 --port 8000
+app = create_app()

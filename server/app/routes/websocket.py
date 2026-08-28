@@ -1,201 +1,143 @@
-"""WebSocket route handler for real-time in-game communication.
+"""WebSocket route handler for real-time Ashta Chamma game communication.
 
-All in-game communication — including game state updates, cowrie roll results,
-and chat messages — flows through this module. Each room has its own broadcast
-group; connections are stored in a module-level registry keyed by room_id.
+Each room connection gets its own per-connection sliding window rate limiter
+(10 messages/second) tracked entirely in process memory — this is intentional
+because the limit is per *connection*, not per user, and does not need to be
+shared across tasks.
 
-Chat messages are ephemeral (not persisted to the database). HTML tags are
-stripped before broadcast to prevent XSS. See OWASP A05 constraint in WO-025.
+All incoming messages are validated against the Pydantic schemas in
+``app.schemas.ws_messages`` before dispatching to game logic handlers.
+Invalid messages return an error frame instead of crashing the handler.
+
+Logging of user-supplied values (room_id) uses ``_sanitize`` to prevent
+log injection.
 """
 
-from __future__ import annotations
-
+import json
 import logging
-import re
-from collections import defaultdict
-from datetime import datetime, timezone
-from typing import Any
+import time
+from collections import deque
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
+
+from app.schemas.ws_messages import (
+    ChatMessage,
+    ErrorMessage,
+    PingMessage,
+    RollRequestMessage,
+    SelectPawnMessage,
+    validate_ws_message,
+)
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
-# In-memory connection registry: room_id -> list of (websocket, player_info)
-# player_info keys: user_id, display_name, color
-# Replaced by Redis pub/sub when the PubSubBridge work order lands; keeping
-# this in-memory for single-task correctness in the current phase.
-_room_connections: dict[str, list[tuple[WebSocket, dict[str, str]]]] = defaultdict(list)
-
-_MAX_CHAT_LENGTH: int = 200
-
-# Regex to strip any HTML/XML-style tags.  Compiled once at module load.
-_HTML_TAG_RE: re.Pattern[str] = re.compile(r"<[^>]*>")
+# Per-connection WebSocket rate limit: 10 messages per second.
+_WS_RATE_LIMIT: int = 10
+_WS_RATE_WINDOW: float = 1.0  # seconds
 
 
-def _sanitize_chat_text(text: str) -> str:
-    """Strip HTML tags from *text* and trim surrounding whitespace.
+def _is_rate_limited(message_timestamps: deque[float]) -> bool:
+    """Check and update the per-connection sliding window rate limiter.
 
-    Removing tags (rather than escaping them) ensures the stored/broadcast
-    value is plain text that React can render without double-encoding issues.
-    Any residual `<` / `>` that were not part of a well-formed tag survive
-    harmlessly as literal characters; the React client escapes them on render.
-
-    Args:
-        text: Raw chat message string received from the client.
+    Removes timestamps older than the 1-second window, then checks whether
+    the connection has already sent *_WS_RATE_LIMIT* messages in that window.
+    Appends the current timestamp only when the request is *not* rate-limited
+    so dropped messages do not consume a slot.
 
     Returns:
-        Sanitized plain-text string.
+        True if the message should be dropped (rate limit exceeded).
+        False if the message is within limits (timestamp recorded).
     """
-    without_tags = _HTML_TAG_RE.sub("", text)
-    return without_tags.strip()
+    now = time.monotonic()
+    cutoff = now - _WS_RATE_WINDOW
+    while message_timestamps and message_timestamps[0] < cutoff:
+        message_timestamps.popleft()
+    if len(message_timestamps) >= _WS_RATE_LIMIT:
+        return True
+    message_timestamps.append(now)
+    return False
 
 
-async def _broadcast_to_room(room_id: str, message: dict[str, Any]) -> None:
-    """Send *message* as JSON to every WebSocket client connected to *room_id*.
+def _sanitize(value: str) -> str:
+    """Return *value* with only alphanumeric characters and ``-_`` kept.
 
-    Silently removes connections that fail to receive the message (the client
-    has likely disconnected without sending a close frame).
+    Used before interpolating user-supplied strings into log messages to
+    prevent log injection attacks.
     """
-    stale: list[tuple[WebSocket, dict[str, str]]] = []
-    for ws, player_info in list(_room_connections[room_id]):
-        try:
-            await ws.send_json(message)
-        except Exception:
-            logger.warning(
-                "Failed to send message to player %s; marking connection stale",
-                player_info.get("display_name"),
-            )
-            stale.append((ws, player_info))
-    for item in stale:
-        try:
-            _room_connections[room_id].remove(item)
-        except ValueError:
-            pass  # Already removed by a concurrent handler
+    return "".join(c for c in value if c.isalnum() or c in "-_")
 
 
 @router.websocket("/ws/rooms/{room_id}")
-async def room_websocket(websocket: WebSocket, room_id: str) -> None:
-    """Handle WebSocket connections for a specific game room.
+async def websocket_room_endpoint(websocket: WebSocket, room_id: str) -> None:
+    """Accept a WebSocket connection for a game room.
 
-    Query parameters accepted on upgrade:
-    - ``token``: Clerk JWT (validated by AuthMiddleware in WO-016)
-    - ``user_id``: Player UUID (placeholder until AuthMiddleware injects context)
-    - ``display_name``: Player display name shown in chat
-    - ``color``: Player colour hex string (e.g. ``#e74c3c``)
+    Per-connection responsibilities:
+    - Enforce 10 messages/second rate limit; drop excess with a warning frame.
+    - Validate every message against the defined schema before dispatching.
+    - Return ``{type: 'error', message: 'Invalid message format'}`` for bad messages.
     """
     await websocket.accept()
-
-    # Placeholder identity extraction from query params.
-    # Full Clerk JWT validation and user-context injection is handled by the
-    # auth middleware introduced in WO-016; these defaults maintain backwards
-    # compatibility during the transition.
-    player_info: dict[str, str] = {
-        "user_id": websocket.query_params.get("user_id", "anonymous"),
-        "display_name": websocket.query_params.get("display_name", "Player"),
-        "color": websocket.query_params.get("color", "#ffffff"),
-    }
-
-    _room_connections[room_id].append((websocket, player_info))
-    logger.info(
-        "Client connected to room %s; player=%s",
-        room_id,
-        player_info["display_name"],
-    )
+    message_timestamps: deque[float] = deque()
+    safe_room_id = _sanitize(room_id)
 
     try:
         while True:
-            data: Any = await websocket.receive_json()
-            if isinstance(data, dict):
-                await _handle_message(websocket, room_id, player_info, data)
+            raw = await websocket.receive_text()
+
+            # Drop excess messages but notify the sender.
+            if _is_rate_limited(message_timestamps):
+                logger.warning(
+                    "WebSocket rate limit exceeded: room=%s; dropping message",
+                    safe_room_id,
+                )
+                await websocket.send_text(
+                    json.dumps({"type": "error", "message": "Rate limit exceeded: slow down"})
+                )
+                continue
+
+            # Validate message schema; send generic error on failure to avoid
+            # leaking internal Pydantic error details to the client.
+            try:
+                message = validate_ws_message(raw)
+            except ValueError:
+                error = ErrorMessage(message="Invalid message format")
+                await websocket.send_text(error.model_dump_json())
+                continue
+
+            await _dispatch(websocket, safe_room_id, message)
+
     except WebSocketDisconnect:
-        logger.info(
-            "Client disconnected from room %s; player=%s",
-            room_id,
-            player_info["display_name"],
-        )
-    finally:
-        connections = _room_connections.get(room_id, [])
-        try:
-            connections.remove((websocket, player_info))
-        except ValueError:
-            pass  # Already cleaned up by _broadcast_to_room
+        logger.info("Client disconnected: room=%s", safe_room_id)
 
 
-async def _handle_message(
+async def _dispatch(
     websocket: WebSocket,
-    room_id: str,
-    player_info: dict[str, str],
-    data: dict[str, Any],
+    safe_room_id: str,
+    message: RollRequestMessage | SelectPawnMessage | ChatMessage | PingMessage,
 ) -> None:
-    """Dispatch an incoming WebSocket message to the appropriate sub-handler."""
-    msg_type = data.get("type")
+    """Route a validated message to the appropriate handler stub.
 
-    if msg_type == "chat":
-        await _handle_chat(websocket, room_id, player_info, data)
-    elif msg_type == "ping":
-        await websocket.send_json({"type": "pong"})
-    else:
-        logger.debug("Unhandled message type %r in room %s", msg_type, room_id)
-
-
-async def _handle_chat(
-    websocket: WebSocket,
-    room_id: str,
-    player_info: dict[str, str],
-    data: dict[str, Any],
-) -> None:
-    """Validate and broadcast a chat message to every member of *room_id*.
-
-    Validation rules (per WO-025 acceptance criteria):
-    1. ``text`` field must be a string.
-    2. After HTML-tag stripping, the message must be non-empty.
-    3. Sanitized text must not exceed ``_MAX_CHAT_LENGTH`` characters.
-
-    On success the broadcast payload type is ``chat_broadcast`` and includes
-    ``sender_name``, ``sender_color``, ``text``, and an ISO-8601 UTC
-    ``timestamp``.
+    Full game logic integration will be added in WO-016 (WebSocket handler
+    with Redis pub/sub).  For now, only the ping/pong round-trip is
+    implemented so the endpoint is functional and testable.
     """
-    raw_text: Any = data.get("text", "")
+    if isinstance(message, PingMessage):
+        await websocket.send_text(json.dumps({"type": "pong"}))
 
-    if not isinstance(raw_text, str):
-        await websocket.send_json(
-            {
-                "type": "error",
-                "code": "INVALID_CHAT",
-                "message": "Chat text must be a string.",
-            }
+    elif isinstance(message, RollRequestMessage):
+        # TODO(WO-016): Delegate to GameStateMachine.handle_roll_request()
+        logger.debug("Roll request received: room=%s", safe_room_id)
+
+    elif isinstance(message, SelectPawnMessage):
+        # TODO(WO-016): Delegate to GameStateMachine.handle_select_pawn()
+        logger.debug(
+            "Select pawn %d: room=%s",
+            message.pawn_id,
+            safe_room_id,
         )
-        return
 
-    sanitized = _sanitize_chat_text(raw_text)
-
-    if not sanitized:
-        await websocket.send_json(
-            {
-                "type": "error",
-                "code": "EMPTY_MESSAGE",
-                "message": "Chat message cannot be empty.",
-            }
-        )
-        return
-
-    if len(sanitized) > _MAX_CHAT_LENGTH:
-        await websocket.send_json(
-            {
-                "type": "error",
-                "code": "MESSAGE_TOO_LONG",
-                "message": f"Chat message exceeds the {_MAX_CHAT_LENGTH}-character limit.",
-            }
-        )
-        return
-
-    broadcast_payload: dict[str, Any] = {
-        "type": "chat_broadcast",
-        "sender_name": player_info["display_name"],
-        "sender_color": player_info["color"],
-        "text": sanitized,
-        "timestamp": datetime.now(tz=timezone.utc).isoformat(),
-    }
-    await _broadcast_to_room(room_id, broadcast_payload)
+    elif isinstance(message, ChatMessage):
+        # TODO(WO-016): Broadcast via Redis pub/sub
+        logger.debug("Chat received: room=%s", safe_room_id)

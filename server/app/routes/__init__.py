@@ -1,5 +1,5 @@
-"""Routes package for the Ashta Chamma FastAPI backend.
+"""Route (controller) package for Ashta Chamma 3D.
 
-Routers defined in sub-modules are imported by the main application factory
-and registered with the FastAPI app instance.
+Route handlers are thin: parse request → call service → format response.
+No business logic or database queries belong in this layer.
 """
