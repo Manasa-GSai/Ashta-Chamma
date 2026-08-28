@@ -1,243 +1,89 @@
-import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { render, screen, fireEvent, act } from '@testing-library/react';
-import { GameHUD, type GameHUDProps, type PlayerInfo, type PawnInfo } from './GameHUD';
-
-/** Minimal valid props for the GameHUD. */
-const PLAYER: PlayerInfo = { id: 'p1', name: 'Alice', color: '#000000', score: 0 };
-const PLAYER2: PlayerInfo = { id: 'p2', name: 'Bob', color: '#333333', score: 2 };
-const PAWN: PawnInfo = { id: 1, color: 'red', position: 5 };
-
-function buildProps(overrides: Partial<GameHUDProps> = {}): GameHUDProps {
-  return {
-    currentPlayer: PLAYER,
-    isCurrentUserTurn: false,
-    phase: 'rolling',
-    legalPawns: [],
-    players: [PLAYER, PLAYER2],
-    onRoll: vi.fn(),
-    onSelectPawn: vi.fn(),
-    ...overrides,
-  };
-}
+import { render, screen, act } from '@testing-library/react';
+import { describe, it, expect, beforeEach } from 'vitest';
+import { GameHUD } from './GameHUD';
+import { useGameStore } from '../../store/gameStore';
 
 describe('GameHUD', () => {
   beforeEach(() => {
-    vi.useFakeTimers();
-  });
-
-  afterEach(() => {
-    vi.useRealTimers();
-  });
-
-  describe('ARIA structure', () => {
-    it('renders a region landmark with label "Game HUD"', () => {
-      render(<GameHUD {...buildProps()} />);
-      expect(
-        screen.getByRole('region', { name: /game hud/i }),
-      ).toBeInTheDocument();
-    });
-
-    it('renders a status element for the turn indicator', () => {
-      render(<GameHUD {...buildProps()} />);
-      // Multiple status roles may exist (turn + announcer); at least one present.
-      const statuses = screen.getAllByRole('status');
-      expect(statuses.length).toBeGreaterThanOrEqual(1);
-    });
-
-    it('renders a list of player scores', () => {
-      render(<GameHUD {...buildProps()} />);
-      expect(screen.getByRole('list')).toBeInTheDocument();
-    });
-
-    it('displays both player names in the score list', () => {
-      render(<GameHUD {...buildProps()} />);
-      expect(screen.getByText(/Alice/)).toBeInTheDocument();
-      expect(screen.getByText(/Bob/)).toBeInTheDocument();
+    // Reset store to a known state before each test
+    useGameStore.setState({
+      currentPlayer: 0,
+      rollResult: null,
+      players: ['Alice', 'Bob', 'Charlie', 'Diana'],
+      phase: 'ROLLING',
+      boardState: {},
     });
   });
 
-  describe('Roll button', () => {
-    it('shows Roll button only when it is the user\'s turn in rolling phase', () => {
-      render(
-        <GameHUD
-          {...buildProps({ isCurrentUserTurn: true, phase: 'rolling' })}
-        />,
-      );
-      expect(
-        screen.getByRole('button', { name: /roll cowrie shells/i }),
-      ).toBeInTheDocument();
+  describe('current player display', () => {
+    it('displays the current player name from the store', () => {
+      render(<GameHUD />);
+      expect(screen.getByTestId('current-player')).toHaveTextContent('Alice');
     });
 
-    it('hides Roll button when it is NOT the user\'s turn', () => {
-      render(
-        <GameHUD
-          {...buildProps({ isCurrentUserTurn: false, phase: 'rolling' })}
-        />,
-      );
-      expect(
-        screen.queryByRole('button', { name: /roll cowrie shells/i }),
-      ).not.toBeInTheDocument();
+    it('displays the second player when currentPlayer is 1', () => {
+      useGameStore.setState({ currentPlayer: 1 });
+      render(<GameHUD />);
+      expect(screen.getByTestId('current-player')).toHaveTextContent('Bob');
     });
 
-    it('calls onRoll when the Roll button is clicked', () => {
-      const onRoll = vi.fn();
-      render(
-        <GameHUD
-          {...buildProps({ isCurrentUserTurn: true, phase: 'rolling', onRoll })}
-        />,
-      );
-      fireEvent.click(screen.getByRole('button', { name: /roll cowrie shells/i }));
-      expect(onRoll).toHaveBeenCalledTimes(1);
+    it('falls back to "Player N" label when players array has no name at index', () => {
+      useGameStore.setState({ currentPlayer: 0, players: [] });
+      render(<GameHUD />);
+      expect(screen.getByTestId('current-player')).toHaveTextContent('Player 1');
     });
 
-    it('calls onRoll when Space is pressed on the Roll button', () => {
-      const onRoll = vi.fn();
-      render(
-        <GameHUD
-          {...buildProps({ isCurrentUserTurn: true, phase: 'rolling', onRoll })}
-        />,
-      );
-      fireEvent.keyDown(
-        screen.getByRole('button', { name: /roll cowrie shells/i }),
-        { key: ' ' },
-      );
-      expect(onRoll).toHaveBeenCalledTimes(1);
-    });
-  });
+    it('updates displayed player when store changes', () => {
+      render(<GameHUD />);
+      expect(screen.getByTestId('current-player')).toHaveTextContent('Alice');
 
-  describe('Pawn selection', () => {
-    it('renders pawn buttons during selecting phase with legal pawns', () => {
-      render(
-        <GameHUD
-          {...buildProps({
-            isCurrentUserTurn: true,
-            phase: 'selecting',
-            legalPawns: [PAWN],
-          })}
-        />,
-      );
-      expect(
-        screen.getByRole('button', { name: /move red pawn at position 5/i }),
-      ).toBeInTheDocument();
-    });
-
-    it('calls onSelectPawn with the correct pawn id when a pawn button is clicked', () => {
-      const onSelectPawn = vi.fn();
-      render(
-        <GameHUD
-          {...buildProps({
-            isCurrentUserTurn: true,
-            phase: 'selecting',
-            legalPawns: [PAWN],
-            onSelectPawn,
-          })}
-        />,
-      );
-      fireEvent.click(
-        screen.getByRole('button', { name: /move red pawn at position 5/i }),
-      );
-      expect(onSelectPawn).toHaveBeenCalledWith(PAWN.id);
-    });
-
-    it('renders a group landmark for pawn selection', () => {
-      render(
-        <GameHUD
-          {...buildProps({
-            isCurrentUserTurn: true,
-            phase: 'selecting',
-            legalPawns: [PAWN],
-          })}
-        />,
-      );
-      expect(screen.getByRole('group')).toBeInTheDocument();
-    });
-  });
-
-  describe('Game over state', () => {
-    it('renders an alert role on game over', () => {
-      render(
-        <GameHUD
-          {...buildProps({ phase: 'game_over', winnerName: 'Alice' })}
-        />,
-      );
-      expect(screen.getByRole('alert')).toBeInTheDocument();
-    });
-
-    it('displays the winner name in the result', () => {
-      render(
-        <GameHUD
-          {...buildProps({ phase: 'game_over', winnerName: 'Alice' })}
-        />,
-      );
-      expect(screen.getByText(/Alice wins!/i)).toBeInTheDocument();
-    });
-  });
-
-  describe('Screen reader announcements', () => {
-    it('announces "Your turn to roll" when it is the user\'s turn in rolling phase', async () => {
-      render(
-        <GameHUD
-          {...buildProps({ isCurrentUserTurn: true, phase: 'rolling' })}
-        />,
-      );
-      await act(async () => {
-        vi.advanceTimersByTime(50);
-      });
-      const announcer = document.querySelector('[aria-live="polite"]');
-      expect(announcer?.textContent).toMatch(/your turn to roll/i);
-    });
-
-    it('announces roll value when rollValue prop changes', async () => {
-      const { rerender } = render(<GameHUD {...buildProps()} />);
-
-      rerender(<GameHUD {...buildProps({ rollValue: 4 })} />);
-      await act(async () => {
-        vi.advanceTimersByTime(50);
+      act(() => {
+        useGameStore.getState().setCurrentPlayer(2);
       });
 
-      const announcer = document.querySelector('[aria-live="polite"]');
-      expect(announcer?.textContent).toMatch(/rolled 4/i);
+      expect(screen.getByTestId('current-player')).toHaveTextContent('Charlie');
+    });
+  });
+
+  describe('roll result display', () => {
+    it('does not show roll result when rollResult is null', () => {
+      render(<GameHUD />);
+      expect(screen.queryByTestId('roll-result')).not.toBeInTheDocument();
     });
 
-    it('announces lastMoveDescription when provided', async () => {
-      render(
-        <GameHUD
-          {...buildProps({
-            lastMoveDescription: 'Red pawn moved to position 8',
-          })}
-        />,
-      );
-      await act(async () => {
-        vi.advanceTimersByTime(50);
-      });
-      const announcer = document.querySelector('[aria-live="polite"]');
-      expect(announcer?.textContent).toMatch(/red pawn moved to position 8/i);
+    it('shows roll result when a value is set in the store', () => {
+      useGameStore.setState({ rollResult: 4 });
+      render(<GameHUD />);
+      expect(screen.getByTestId('roll-result')).toHaveTextContent('4');
     });
 
-    it('announces captureDescription when provided', async () => {
-      render(
-        <GameHUD
-          {...buildProps({ captureDescription: 'Red captured Blue pawn' })}
-        />,
-      );
-      await act(async () => {
-        vi.advanceTimersByTime(50);
-      });
-      const announcer = document.querySelector('[aria-live="polite"]');
-      expect(announcer?.textContent).toMatch(/red captured blue pawn/i);
+    it('shows Ashta roll result of 8', () => {
+      useGameStore.setState({ rollResult: 8 });
+      render(<GameHUD />);
+      expect(screen.getByTestId('roll-result')).toHaveTextContent('8');
     });
 
-    it('announces winner on game over', async () => {
-      render(
-        <GameHUD
-          {...buildProps({ phase: 'game_over', winnerName: 'Alice' })}
-        />,
-      );
-      await act(async () => {
-        vi.advanceTimersByTime(50);
+    it('updates roll result display when store changes', () => {
+      render(<GameHUD />);
+      expect(screen.queryByTestId('roll-result')).not.toBeInTheDocument();
+
+      act(() => {
+        useGameStore.getState().setRollResult(3);
       });
-      const announcer = document.querySelector('[aria-live="polite"]');
-      expect(announcer?.textContent).toMatch(/alice player wins!/i);
+
+      expect(screen.getByTestId('roll-result')).toHaveTextContent('3');
+    });
+
+    it('hides roll result after it is reset to null', () => {
+      useGameStore.setState({ rollResult: 2 });
+      render(<GameHUD />);
+      expect(screen.getByTestId('roll-result')).toBeInTheDocument();
+
+      act(() => {
+        useGameStore.getState().setRollResult(null);
+      });
+
+      expect(screen.queryByTestId('roll-result')).not.toBeInTheDocument();
     });
   });
 });

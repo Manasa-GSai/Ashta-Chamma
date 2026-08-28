@@ -1,48 +1,31 @@
 import { create } from 'zustand';
 
-export interface Player {
-  id: string;
-  name: string;
-  color: string;
-  playerIndex: number;
-  isConnected: boolean;
-  isAI: boolean;
-}
+export type GamePhase = 'WAITING' | 'ROLLING' | 'SELECTING' | 'MOVING' | 'GAME_OVER';
 
-export type GamePhase = 'waiting' | 'rolling' | 'selecting' | 'moving' | 'game_over';
-
-interface GameStore {
-  roomCode: string | null;
-  players: Player[];
-  currentPlayerIndex: number;
-  lastRollResult: number | null;
+export interface GameState {
+  currentPlayer: number;
+  rollResult: number | null;
   phase: GamePhase;
-
-  setRoomCode: (code: string | null) => void;
-  setPlayers: (players: Player[]) => void;
-  setCurrentPlayerIndex: (index: number) => void;
-  setLastRollResult: (result: number | null) => void;
+  players: string[];
+  boardState: Record<string, number>;
+  setCurrentPlayer: (player: number) => void;
+  setRollResult: (result: number | null) => void;
   setPhase: (phase: GamePhase) => void;
-  reset: () => void;
+  resetGame: () => void;
 }
 
-const initialState: Pick<
-  GameStore,
-  'roomCode' | 'players' | 'currentPlayerIndex' | 'lastRollResult' | 'phase'
-> = {
-  roomCode: null,
+const initialState = {
+  currentPlayer: 0,
+  rollResult: null,
+  phase: 'WAITING' as GamePhase,
   players: [],
-  currentPlayerIndex: 0,
-  lastRollResult: null,
-  phase: 'waiting',
+  boardState: {},
 };
 
-export const useGameStore = create<GameStore>()((set) => ({
+export const useGameStore = create<GameState>((set) => ({
   ...initialState,
-  setRoomCode: (code) => set({ roomCode: code }),
-  setPlayers: (players) => set({ players }),
-  setCurrentPlayerIndex: (index) => set({ currentPlayerIndex: index }),
-  setLastRollResult: (result) => set({ lastRollResult: result }),
+  setCurrentPlayer: (player) => set({ currentPlayer: player }),
+  setRollResult: (result) => set({ rollResult: result }),
   setPhase: (phase) => set({ phase }),
-  reset: () => set(initialState),
+  resetGame: () => set(initialState),
 }));

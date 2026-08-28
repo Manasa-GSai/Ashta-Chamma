@@ -1,37 +1,37 @@
+import { type JSX, type ChangeEvent } from 'react';
 import { useTranslation } from 'react-i18next';
-import { SUPPORTED_LANGUAGES, type SupportedLanguage } from '../i18n/config';
 
-/** Human-readable display labels for each supported locale. */
-const LANGUAGE_LABELS: Record<SupportedLanguage, string> = {
-  en: 'English',
-  te: 'తెలుగు',
-};
+interface Language {
+  code: string;
+  label: string;
+}
 
-/**
- * Language toggle dropdown rendered on every screen.
- * Calls i18n.changeLanguage() so all visible text updates immediately
- * without a page reload. The preference is persisted via the listener
- * registered in i18n/config.ts.
- */
+const LANGUAGES: Language[] = [
+  { code: 'en', label: 'English' },
+  { code: 'te', label: 'తెలుగు' },
+  { code: 'hi', label: 'हिंदी' },
+];
+
 export const LanguageToggle = (): JSX.Element => {
   const { i18n, t } = useTranslation();
 
-  const handleChange = (event: React.ChangeEvent<HTMLSelectElement>): void => {
-    void i18n.changeLanguage(event.target.value);
+  const handleChange = (e: ChangeEvent<HTMLSelectElement>) => {
+    // Fire-and-forget; errors are handled by i18next internally
+    void i18n.changeLanguage(e.target.value);
   };
 
   return (
     <div className="language-toggle">
-      <label htmlFor="language-select">{t('common.language')}</label>
+      <label htmlFor="language-select">{t('language', 'Language')}</label>
       <select
         id="language-select"
         value={i18n.language}
         onChange={handleChange}
-        aria-label={t('common.language')}
+        aria-label="Select language"
       >
-        {SUPPORTED_LANGUAGES.map((code) => (
-          <option key={code} value={code}>
-            {LANGUAGE_LABELS[code]}
+        {LANGUAGES.map((lang) => (
+          <option key={lang.code} value={lang.code}>
+            {lang.label}
           </option>
         ))}
       </select>
