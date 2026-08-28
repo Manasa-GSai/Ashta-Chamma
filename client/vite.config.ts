@@ -1,5 +1,4 @@
-/// <reference types="vitest" />
-import { defineConfig } from 'vite';
+import { defineConfig } from 'vitest/config';
 import react from '@vitejs/plugin-react';
 
 export default defineConfig({
@@ -12,9 +11,7 @@ export default defineConfig({
     sourcemap: true,
   },
   test: {
-    // Run store tests in a Node environment — no DOM required since the store
-    // is framework-agnostic and tests use the raw getState/setState API.
-    environment: 'node',
-    include: ['src/**/__tests__/**/*.test.ts', 'src/**/*.test.ts'],
+    environment: 'jsdom',
+    setupFiles: ['./src/tests/setup.ts'],
   },
 });

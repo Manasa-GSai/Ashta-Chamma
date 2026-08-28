@@ -1,15 +1,25 @@
-import { Suspense, useState } from 'react';
-import type { JSX } from 'react';
-import { Canvas } from '@react-three/fiber';
-import { CowriePhysics, SHELL_COUNT } from './components/Cowrie/CowriePhysics';
+import { BrowserRouter, Navigate, Route, Routes } from 'react-router-dom';
+import { NavBar } from './components/NavBar';
+import { ProtectedRoute } from './components/ProtectedRoute';
+import { SignIn } from './pages/SignIn';
+import { SignUp } from './pages/SignUp';
+import { AuthProvider } from './providers/AuthProvider';
 
-/**
- * Demo of the CowriePhysics component.
- *
- * In production the roll trigger and roll result come from the WebSocket
- * client (WO-028); here they are simulated locally so the animation can be
- * previewed standalone.
- */
+// Placeholder pages — replaced by full implementations in later work orders.
+const Lobby = (): JSX.Element => (
+  <main>
+    <h1>Lobby</h1>
+    <p>Game lobby — coming soon.</p>
+  </main>
+);
+
+const Game = (): JSX.Element => (
+  <main>
+    <h1>Game</h1>
+    <p>3D game board — coming soon.</p>
+  </main>
+);
+
 export const App = (): JSX.Element => {
   const [rollTrigger, setRollTrigger] = useState(0);
   const [rollResult, setRollResult] = useState<boolean[] | null>(null);
@@ -34,56 +44,24 @@ export const App = (): JSX.Element => {
   };
 
   return (
-    <main style={{ width: '100vw', height: '100vh', background: '#1a1006' }}>
-      {/* 3D viewport */}
-      <Canvas
-        camera={{ position: [0, 2.5, 3.5], fov: 45 }}
-        shadows
-        style={{ width: '100%', height: '80vh' }}
-      >
-        <Suspense fallback={null}>
-          <CowriePhysics
-            rollResult={rollResult}
-            rollTrigger={rollTrigger}
-            onSettled={handleSettled}
-          />
-        </Suspense>
-      </Canvas>
+    <AuthProvider>
+      <BrowserRouter>
+        <NavBar />
+        <Routes>
+          {/* Public auth routes */}
+          <Route path="/sign-in/*" element={<SignIn />} />
+          <Route path="/sign-up/*" element={<SignUp />} />
 
-      {/* HUD overlay */}
-      <div
-        style={{
-          position: 'absolute',
-          bottom: 24,
-          left: '50%',
-          transform: 'translateX(-50%)',
-          display: 'flex',
-          flexDirection: 'column',
-          alignItems: 'center',
-          gap: 8,
-        }}
-      >
-        <button
-          onClick={handleRoll}
-          disabled={isRolling}
-          style={{
-            padding: '12px 32px',
-            fontSize: 18,
-            fontWeight: 600,
-            borderRadius: 8,
-            border: 'none',
-            background: isRolling ? '#555' : '#d4881a',
-            color: '#fff',
-            cursor: isRolling ? 'not-allowed' : 'pointer',
-          }}
-        >
-          {isRolling ? 'Rolling…' : 'Roll Cowries'}
-        </button>
+          {/* Protected routes — redirect to /sign-in when unauthenticated */}
+          <Route element={<ProtectedRoute />}>
+            <Route path="/lobby" element={<Lobby />} />
+            <Route path="/game" element={<Game />} />
+          </Route>
 
-        {settleSummary !== null && (
-          <p style={{ color: '#e8d5a8', margin: 0 }}>{settleSummary}</p>
-        )}
-      </div>
-    </main>
+          {/* Default: redirect root to /lobby (ProtectedRoute handles auth check) */}
+          <Route path="/" element={<Navigate to="/lobby" replace />} />
+        </Routes>
+      </BrowserRouter>
+    </AuthProvider>
   );
 };
