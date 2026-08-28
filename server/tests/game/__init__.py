@@ -1,1 +1,1 @@
-"""Tests for the Ashta Chamma game engine package."""
+"""Tests for the server-side game logic package (app.game)."""
