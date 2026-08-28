@@ -1,0 +1,65 @@
+{
+  "main_menu": {
+    "title": "Ashta Chamma",
+    "subtitle": "The Ancient Indian Board Game",
+    "play": "Play",
+    "rules": "Rules",
+    "sign_out": "Sign Out"
+  },
+  "lobby": {
+    "title": "Game Lobby",
+    "back": "Back",
+    "create": {
+      "title": "Create Room",
+      "max_players": "Max Players",
+      "ai_personas": "AI Opponents (optional)",
+      "submit": "Create Room",
+      "loading": "Creating..."
+    },
+    "join": {
+      "title": "Join Room",
+      "code_label": "Room Code",
+      "code_placeholder": "Enter 6-character code",
+      "submit": "Join Room",
+      "loading": "Joining...",
+      "code_error": "Room code must be exactly 6 alphanumeric characters"
+    }
+  },
+  "rules": {
+    "title": "Ashta Chamma Rules",
+    "back": "Back",
+    "objective_title": "Objective",
+    "objective_content": "Be the first player to move all 4 of your pawns from your home base to the center of the board.",
+    "cowrie_title": "Cowrie Rolls",
+    "cowrie_content": "Throw 4 cowrie shells to determine your move. The number of face-up shells determines your move distance.",
+    "roll_values_title": "Roll Values",
+    "roll_0": "0 face-up = 8 (Ashta) — extra turn, can enter new pawn",
+    "roll_1": "1 face-up = 1 — extra turn, can enter new pawn",
+    "roll_2": "2 face-up = 2",
+    "roll_3": "3 face-up = 3",
+    "roll_4": "4 face-up = 4 (Chamma) — extra turn",
+    "movement_title": "Movement",
+    "movement_content": "Pawns move counterclockwise around the outer track, then up the inner home stretch. Landing on an opponent's pawn on a non-safe square captures it, sending it back to base.",
+    "safe_squares_title": "Safe Squares",
+    "safe_squares_content": "Marked squares are safe zones where pawns cannot be captured. Multiple pawns of different players may occupy safe squares simultaneously."
+  },
+  "hud": {
+    "current_turn": "Current Turn",
+    "last_roll": "Last Roll",
+    "exit": "Exit",
+    "players": "Players",
+    "connected": "Connected",
+    "disconnected": "Disconnected",
+    "ai_label": "AI",
+    "no_roll": "—",
+    "you": "(You)",
+    "exit_loading": "Leaving...",
+    "exit_error": "Failed to leave room"
+  },
+  "common": {
+    "loading": "Loading...",
+    "error": "An error occurred. Please try again.",
+    "retry": "Retry",
+    "back": "Back"
+  }
+}
