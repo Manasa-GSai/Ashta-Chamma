@@ -32,8 +32,9 @@ void i18n.use(initReactI18next).init({
   fallbackLng: 'en',
   // React already escapes values — no double-escaping needed
   interpolation: { escapeValue: false },
-  // Resources are bundled inline, so initialisation is synchronous
-  initImmediate: false,
+  // Resources are bundled inline, so initialisation is synchronous.
+  // initImmediate was removed in i18next v23+ — omitting it is the correct
+  // way to request synchronous init when resources are pre-loaded.
 });
 
 // Persist language choice whenever the user switches languages

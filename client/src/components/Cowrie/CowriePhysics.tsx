@@ -312,13 +312,7 @@ export const CowriePhysics = (props: CowriePhysicsProps): JSX.Element => {
      * Wrapping here prevents the parent app from needing its own Suspense.
      */
     <Suspense fallback={null}>
-      <Physics
-        gravity={[0, -9.81, 0]}
-        // Limit simulation substeps to maintain 60 FPS on mid-range devices.
-        maxStabilizationIterations={4}
-        maxVelocityFrictionIterations={8}
-        maxVelocityIterations={4}
-      >
+      <Physics gravity={[0, -9.81, 0]}>
         <CowriePhysicsScene {...props} />
       </Physics>
     </Suspense>

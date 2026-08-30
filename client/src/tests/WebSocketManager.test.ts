@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { WebSocketManager, type WebSocketMessage } from '../services/WebSocketManager';
+import { WebSocketManager } from '../services/WebSocketManager';
 
 // ---------------------------------------------------------------------------
 // Minimal in-memory WebSocket stub — enough to exercise the manager logic.
@@ -14,13 +14,20 @@ const createMockSocket = (): {
   removeEventListener: (type: string, listener: StoredListener) => void;
   send: (data: string) => void;
   close: () => void;
-  simulateMessage: (data: WebSocketMessage) => void;
+  simulateOpen: () => void;
+  simulateMessage: (data: Record<string, unknown>) => void;
+  simulateClose: () => void;
 } => {
   const listenerMap = new Map<string, StoredListener[]>();
   const sentMessages: string[] = [];
 
+  const emit = (type: string, event: Event): void => {
+    const listeners = listenerMap.get(type) ?? [];
+    listeners.forEach((l) => l(event));
+  };
+
   return {
-    readyState: 1, // equivalent to WebSocket.OPEN
+    readyState: 0,
     sentMessages,
     addEventListener(type: string, listener: StoredListener): void {
       const existing = listenerMap.get(type) ?? [];
@@ -37,12 +44,19 @@ const createMockSocket = (): {
       sentMessages.push(data);
     },
     close(): void {
-      this.readyState = 3; // WebSocket.CLOSED
+      this.readyState = 3;
+      emit('close', new Event('close'));
     },
-    simulateMessage(data: WebSocketMessage): void {
-      const listeners = listenerMap.get('message') ?? [];
+    simulateOpen(): void {
+      this.readyState = 1;
+      emit('open', new Event('open'));
+    },
+    simulateMessage(data: Record<string, unknown>): void {
       const event = { data: JSON.stringify(data) } as MessageEvent<string>;
-      listeners.forEach((l) => l(event as unknown as Event));
+      emit('message', event as unknown as Event);
+    },
+    simulateClose(): void {
+      this.close();
     },
   };
 };
@@ -53,17 +67,17 @@ describe('WebSocketManager', () => {
   let MockWebSocketCtor: ReturnType<typeof vi.fn>;
 
   beforeEach(() => {
-    manager = new WebSocketManager();
+    WebSocketManager.resetInstance();
+    manager = WebSocketManager.getInstance();
     mockSocket = createMockSocket();
     MockWebSocketCtor = vi.fn().mockImplementation(() => mockSocket);
-    // Attach static constants so WebSocketManager can read WebSocket.OPEN.
     Object.assign(MockWebSocketCtor, { CONNECTING: 0, OPEN: 1, CLOSING: 2, CLOSED: 3 });
     vi.stubGlobal('WebSocket', MockWebSocketCtor);
   });
 
   afterEach(() => {
     vi.unstubAllGlobals();
-    manager.disconnect();
+    WebSocketManager.resetInstance();
   });
 
   it('passes the JWT token as a query parameter in the WebSocket URL', () => {
@@ -80,42 +94,40 @@ describe('WebSocketManager', () => {
     );
   });
 
-  it('dispatches incoming messages to registered handlers by type', () => {
+  it('dispatches incoming messages to registered handlers', () => {
     const handler = vi.fn();
-    manager.on('state_update', handler);
+    const unsubscribe = manager.onMessage(handler);
     manager.connect('r1', 'tok');
+    mockSocket.simulateOpen();
 
     mockSocket.simulateMessage({ type: 'state_update', state: { turn: 2 } });
 
     expect(handler).toHaveBeenCalledOnce();
-    expect(handler).toHaveBeenCalledWith({ type: 'state_update', state: { turn: 2 } });
-  });
-
-  it('ignores messages intended for other handler types', () => {
-    const handler = vi.fn();
-    manager.on('roll_result', handler);
-    manager.connect('r1', 'tok');
-
-    mockSocket.simulateMessage({ type: 'state_update' });
-
-    expect(handler).not.toHaveBeenCalled();
+    expect(handler).toHaveBeenCalledWith('state_update', { state: { turn: 2 } });
+    unsubscribe();
   });
 
   it('sends serialised JSON messages when the socket is open', () => {
     manager.connect('r1', 'tok');
-    manager.send({ type: 'roll_request' });
+    mockSocket.simulateOpen();
+    manager.send('roll_request');
 
     expect(mockSocket.sentMessages).toEqual([JSON.stringify({ type: 'roll_request' })]);
   });
 
-  it('removes a specific handler when off() is called', () => {
+  it('removes a handler when the unsubscribe function is called', () => {
     const handler = vi.fn();
-    manager.on('ping', handler);
-    manager.off('ping', handler);
-    manager.connect('r1', 'tok');
+    const unsubscribe = manager.onMessage(handler);
+    unsubscribe();
 
+    manager.connect('r1', 'tok');
+    mockSocket.simulateOpen();
     mockSocket.simulateMessage({ type: 'ping' });
 
     expect(handler).not.toHaveBeenCalled();
+  });
+
+  it('reports isConnected as false before connecting', () => {
+    expect(manager.isConnected).toBe(false);
   });
 });

@@ -1,9 +1,7 @@
 import { render, screen } from '@testing-library/react';
-import { type ReactElement } from 'react';
-import { MemoryRouter } from 'react-router-dom';
+import { MemoryRouter, Route, Routes } from 'react-router-dom';
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 
-// Mock Clerk so tests run without a ClerkProvider
 vi.mock('@clerk/clerk-react', () => ({
   useAuth: vi.fn(),
 }));
@@ -11,11 +9,24 @@ vi.mock('@clerk/clerk-react', () => ({
 import { useAuth } from '@clerk/clerk-react';
 import { ProtectedRoute } from './ProtectedRoute';
 
-// Helper to cast the mock so TypeScript is happy
 const mockUseAuth = vi.mocked(useAuth);
 
-const renderWithRouter = (ui: ReactElement, initialPath = '/') => {
-  return render(<MemoryRouter initialEntries={[initialPath]}>{ui}</MemoryRouter>);
+/**
+ * ProtectedRoute is a React Router v6 layout route — child routes render via
+ * <Outlet />.  The test renders it as the element of a parent <Route> wrapping
+ * a protected child route, matching how it is used in production.
+ */
+const renderWithRouter = (initialPath = '/protected') => {
+  return render(
+    <MemoryRouter initialEntries={[initialPath]}>
+      <Routes>
+        <Route path="/sign-in" element={<div>Sign In Page</div>} />
+        <Route element={<ProtectedRoute />}>
+          <Route path="/protected" element={<div>Protected Content</div>} />
+        </Route>
+      </Routes>
+    </MemoryRouter>,
+  );
 };
 
 describe('ProtectedRoute', () => {
@@ -28,24 +39,16 @@ describe('ProtectedRoute', () => {
       mockUseAuth.mockReturnValue({
         isSignedIn: true,
         isLoaded: true,
-      } as ReturnType<typeof useAuth>);
+      } as unknown as ReturnType<typeof useAuth>);
     });
 
-    it('renders the child element', () => {
-      renderWithRouter(
-        <ProtectedRoute>
-          <div>Protected Content</div>
-        </ProtectedRoute>,
-      );
+    it('renders the protected child route', () => {
+      renderWithRouter('/protected');
       expect(screen.getByText('Protected Content')).toBeInTheDocument();
     });
 
     it('does not show a loading indicator', () => {
-      renderWithRouter(
-        <ProtectedRoute>
-          <div>Protected Content</div>
-        </ProtectedRoute>,
-      );
+      renderWithRouter('/protected');
       expect(screen.queryByText(/loading/i)).not.toBeInTheDocument();
     });
   });
@@ -55,54 +58,31 @@ describe('ProtectedRoute', () => {
       mockUseAuth.mockReturnValue({
         isSignedIn: false,
         isLoaded: true,
-      } as ReturnType<typeof useAuth>);
+      } as unknown as ReturnType<typeof useAuth>);
     });
 
-    it('does not render the child element', () => {
-      renderWithRouter(
-        <ProtectedRoute>
-          <div>Protected Content</div>
-        </ProtectedRoute>,
-        '/protected',
-      );
+    it('redirects to /sign-in and does not render the child route', () => {
+      renderWithRouter('/protected');
       expect(screen.queryByText('Protected Content')).not.toBeInTheDocument();
-    });
-
-    it('redirects (Navigate is rendered instead of children)', () => {
-      renderWithRouter(
-        <ProtectedRoute>
-          <div>Protected Content</div>
-        </ProtectedRoute>,
-        '/protected',
-      );
-      // The child should not be visible — Navigate replaces it
-      expect(screen.queryByText('Protected Content')).not.toBeInTheDocument();
+      expect(screen.getByText('Sign In Page')).toBeInTheDocument();
     });
   });
 
   describe('when auth is still loading', () => {
     beforeEach(() => {
       mockUseAuth.mockReturnValue({
-        isSignedIn: false,
+        isSignedIn: undefined,
         isLoaded: false,
-      } as ReturnType<typeof useAuth>);
+      } as unknown as ReturnType<typeof useAuth>);
     });
 
     it('renders a loading indicator', () => {
-      renderWithRouter(
-        <ProtectedRoute>
-          <div>Protected Content</div>
-        </ProtectedRoute>,
-      );
+      renderWithRouter('/protected');
       expect(screen.getByText(/loading/i)).toBeInTheDocument();
     });
 
-    it('does not render the child element while loading', () => {
-      renderWithRouter(
-        <ProtectedRoute>
-          <div>Protected Content</div>
-        </ProtectedRoute>,
-      );
+    it('does not render the child route while loading', () => {
+      renderWithRouter('/protected');
       expect(screen.queryByText('Protected Content')).not.toBeInTheDocument();
     });
   });

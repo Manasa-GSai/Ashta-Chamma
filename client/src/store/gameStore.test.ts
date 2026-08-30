@@ -1,32 +1,45 @@
 import { describe, it, expect, beforeEach } from 'vitest';
 import { useGameStore } from './gameStore';
+import { GamePhase } from './types';
 
 describe('useGameStore', () => {
   beforeEach(() => {
-    // Reset to initial state before each test
     useGameStore.setState({
-      currentPlayer: 0,
-      rollResult: null,
-      phase: 'WAITING',
+      currentPlayerIndex: 0,
+      currentRoll: null,
+      gamePhase: GamePhase.WAITING,
       players: [],
-      boardState: {},
+      legalMoveIds: [],
+      moveOptions: [],
+      pawns: [],
+      roomCode: null,
+      roomStatus: 'WAITING',
+      chatMessages: [],
+      isChatOpen: false,
+      connectionState: 'disconnected',
+      reconnectAttempts: 0,
+      connectionError: null,
+      profile: null,
+      isAuthenticated: false,
+      errorMessage: null,
+      isLoading: false,
     });
   });
 
   describe('initial state', () => {
-    it('has currentPlayer of 0', () => {
-      const { currentPlayer } = useGameStore.getState();
-      expect(currentPlayer).toBe(0);
+    it('has currentPlayerIndex of 0', () => {
+      const { currentPlayerIndex } = useGameStore.getState();
+      expect(currentPlayerIndex).toBe(0);
     });
 
-    it('has null rollResult', () => {
-      const { rollResult } = useGameStore.getState();
-      expect(rollResult).toBeNull();
+    it('has null currentRoll', () => {
+      const { currentRoll } = useGameStore.getState();
+      expect(currentRoll).toBeNull();
     });
 
-    it('has WAITING phase', () => {
-      const { phase } = useGameStore.getState();
-      expect(phase).toBe('WAITING');
+    it('has WAITING gamePhase', () => {
+      const { gamePhase } = useGameStore.getState();
+      expect(gamePhase).toBe(GamePhase.WAITING);
     });
 
     it('has empty players array', () => {
@@ -34,102 +47,110 @@ describe('useGameStore', () => {
       expect(players).toHaveLength(0);
     });
 
-    it('has empty boardState', () => {
-      const { boardState } = useGameStore.getState();
-      expect(boardState).toEqual({});
+    it('has empty pawns array', () => {
+      const { pawns } = useGameStore.getState();
+      expect(pawns).toEqual([]);
     });
   });
 
-  describe('setCurrentPlayer', () => {
-    it('updates currentPlayer to given value', () => {
-      useGameStore.getState().setCurrentPlayer(2);
-      expect(useGameStore.getState().currentPlayer).toBe(2);
-    });
-
-    it('updates currentPlayer to player index 3', () => {
-      useGameStore.getState().setCurrentPlayer(3);
-      expect(useGameStore.getState().currentPlayer).toBe(3);
-    });
-
-    it('does not affect other state fields', () => {
-      useGameStore.getState().setCurrentPlayer(1);
-      const { rollResult, phase } = useGameStore.getState();
-      expect(rollResult).toBeNull();
-      expect(phase).toBe('WAITING');
-    });
-  });
-
-  describe('setRollResult', () => {
-    it('updates rollResult to a number', () => {
-      useGameStore.getState().setRollResult(4);
-      expect(useGameStore.getState().rollResult).toBe(4);
-    });
-
-    it('updates rollResult to 8 (Ashta)', () => {
-      useGameStore.getState().setRollResult(8);
-      expect(useGameStore.getState().rollResult).toBe(8);
-    });
-
-    it('can set rollResult back to null', () => {
-      useGameStore.getState().setRollResult(4);
-      useGameStore.getState().setRollResult(null);
-      expect(useGameStore.getState().rollResult).toBeNull();
-    });
-  });
-
-  describe('setPhase', () => {
+  describe('setGamePhase', () => {
     it('transitions to ROLLING phase', () => {
-      useGameStore.getState().setPhase('ROLLING');
-      expect(useGameStore.getState().phase).toBe('ROLLING');
+      useGameStore.getState().setGamePhase(GamePhase.ROLLING);
+      expect(useGameStore.getState().gamePhase).toBe(GamePhase.ROLLING);
     });
 
     it('transitions to SELECTING phase', () => {
-      useGameStore.getState().setPhase('SELECTING');
-      expect(useGameStore.getState().phase).toBe('SELECTING');
+      useGameStore.getState().setGamePhase(GamePhase.SELECTING);
+      expect(useGameStore.getState().gamePhase).toBe(GamePhase.SELECTING);
     });
 
     it('transitions to MOVING phase', () => {
-      useGameStore.getState().setPhase('MOVING');
-      expect(useGameStore.getState().phase).toBe('MOVING');
+      useGameStore.getState().setGamePhase(GamePhase.MOVING);
+      expect(useGameStore.getState().gamePhase).toBe(GamePhase.MOVING);
     });
 
     it('transitions to GAME_OVER phase', () => {
-      useGameStore.getState().setPhase('GAME_OVER');
-      expect(useGameStore.getState().phase).toBe('GAME_OVER');
+      useGameStore.getState().setGamePhase(GamePhase.GAME_OVER);
+      expect(useGameStore.getState().gamePhase).toBe(GamePhase.GAME_OVER);
     });
   });
 
-  describe('resetGame', () => {
-    it('resets currentPlayer to 0', () => {
-      useGameStore.getState().setCurrentPlayer(3);
-      useGameStore.getState().resetGame();
-      expect(useGameStore.getState().currentPlayer).toBe(0);
+  describe('updateRoll', () => {
+    it('updates currentRoll to the roll value', () => {
+      useGameStore.getState().updateRoll({ value: 4, cowries: [true, false, true, false] });
+      expect(useGameStore.getState().currentRoll).toBe(4);
     });
 
-    it('resets rollResult to null', () => {
-      useGameStore.getState().setRollResult(8);
-      useGameStore.getState().resetGame();
-      expect(useGameStore.getState().rollResult).toBeNull();
+    it('updates to Ashta roll (all mouth-up)', () => {
+      useGameStore.getState().updateRoll({ value: 8, cowries: [true, true, true, true] });
+      expect(useGameStore.getState().currentRoll).toBe(8);
+    });
+  });
+
+  describe('clearSelection', () => {
+    it('resets legalMoveIds to empty array', () => {
+      useGameStore.setState({ legalMoveIds: ['R1', 'G2'] });
+      useGameStore.getState().clearSelection();
+      expect(useGameStore.getState().legalMoveIds).toEqual([]);
+    });
+  });
+
+  describe('setMoveOptions', () => {
+    it('sets moveOptions and derives legalMoveIds from them', () => {
+      useGameStore.getState().setMoveOptions([
+        { pawn_id: 'R1', target_pos: 5 },
+        { pawn_id: 'G2', target_pos: 12 },
+      ]);
+      const { moveOptions, legalMoveIds } = useGameStore.getState();
+      expect(moveOptions).toHaveLength(2);
+      expect(legalMoveIds).toEqual(['R1', 'G2']);
+    });
+  });
+
+  describe('addChatMessage', () => {
+    it('appends a message to chatMessages', () => {
+      const msg = {
+        id: '1',
+        senderName: 'Alice',
+        senderColor: 'red',
+        text: 'Hello',
+        timestamp: new Date().toISOString(),
+      };
+      useGameStore.getState().addChatMessage(msg);
+      expect(useGameStore.getState().chatMessages).toHaveLength(1);
+      expect(useGameStore.getState().chatMessages[0]).toEqual(msg);
+    });
+  });
+
+  describe('toggleChat', () => {
+    it('opens chat when closed', () => {
+      useGameStore.setState({ isChatOpen: false });
+      useGameStore.getState().toggleChat();
+      expect(useGameStore.getState().isChatOpen).toBe(true);
     });
 
-    it('resets phase to WAITING', () => {
-      useGameStore.getState().setPhase('GAME_OVER');
-      useGameStore.getState().resetGame();
-      expect(useGameStore.getState().phase).toBe('WAITING');
+    it('closes chat when open', () => {
+      useGameStore.setState({ isChatOpen: true });
+      useGameStore.getState().toggleChat();
+      expect(useGameStore.getState().isChatOpen).toBe(false);
+    });
+  });
+
+  describe('connection state', () => {
+    it('setConnectionState updates connectionState', () => {
+      useGameStore.getState().setConnectionState('connecting');
+      expect(useGameStore.getState().connectionState).toBe('connecting');
     });
 
-    it('resets entire state when multiple fields are modified', () => {
-      useGameStore.setState({
-        currentPlayer: 2,
-        rollResult: 4,
-        phase: 'MOVING',
-        players: ['Alice', 'Bob'],
-      });
-      useGameStore.getState().resetGame();
-      const state = useGameStore.getState();
-      expect(state.currentPlayer).toBe(0);
-      expect(state.rollResult).toBeNull();
-      expect(state.phase).toBe('WAITING');
+    it('setConnectionError stores the error message', () => {
+      useGameStore.getState().setConnectionError('Lost connection');
+      expect(useGameStore.getState().connectionError).toBe('Lost connection');
+    });
+
+    it('setConnectionError clears the error when null', () => {
+      useGameStore.getState().setConnectionError('err');
+      useGameStore.getState().setConnectionError(null);
+      expect(useGameStore.getState().connectionError).toBeNull();
     });
   });
 });

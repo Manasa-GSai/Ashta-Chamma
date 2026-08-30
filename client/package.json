@@ -18,6 +18,7 @@
     "optimize:gltf": "bash scripts/optimize-gltf.sh"
   },
   "dependencies": {
+    "@clerk/clerk-react": "^5.61.9",
     "@dimforge/rapier3d-compat": "^0.20.0",
     "@react-three/fiber": "^8.17.10",
     "@react-three/rapier": "^1.5.0",

@@ -2,7 +2,7 @@ type MessageHandler = (message: unknown) => void;
 
 /** All messages the client may send to the server. */
 export type OutboundMessage =
-  | { type: 'select_pawn'; pawn_id: number }
+  | { type: 'select_pawn'; pawn_id: string }
   | { type: 'roll_request' }
   | { type: 'chat'; text: string }
   | { type: 'ping' };

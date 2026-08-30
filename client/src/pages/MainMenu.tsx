@@ -1,15 +1,23 @@
-import { Link } from 'react-router-dom';
+import { useNavigate } from 'react-router-dom';
+import type { JSX } from 'react';
 
 /**
- * Main menu / landing page.
- *
- * This component is intentionally lightweight — Three.js and Rapier are NOT
- * imported here so they never appear in the critical-path bundle that the
- * browser must parse before showing this screen.  The Lighthouse performance
- * score is measured against this route, so keeping it thin is essential for
- * meeting the ≥85 target.
+ * Props for the pure MainMenu component.
+ * Both handlers are optional so the component is safe to render in unit tests
+ * without a router context — tests supply mocks; the router-aware wrapper
+ * (default export) wires useNavigate in production.
  */
-const MainMenu = (): JSX.Element => {
+export interface MainMenuProps {
+  onPlay?: () => void;
+  onRules?: () => void;
+}
+
+/**
+ * Pure presentation component — no router dependency.
+ * Named export is used by unit tests and any consumer that wants to control
+ * navigation externally.
+ */
+export const MainMenu = ({ onPlay, onRules }: MainMenuProps): JSX.Element => {
   return (
     <main
       style={{
@@ -24,15 +32,30 @@ const MainMenu = (): JSX.Element => {
       <h1>Ashta Chamma 3D</h1>
       <p>An ancient Indian board game, reimagined in 3D.</p>
       <nav style={{ display: 'flex', gap: '1rem', marginTop: '2rem' }}>
-        <Link to="/game">
-          <button type="button">Play</button>
-        </Link>
-        <Link to="/leaderboard">
-          <button type="button">Leaderboard</button>
-        </Link>
+        <button type="button" onClick={onPlay}>
+          Play
+        </button>
+        <button type="button" onClick={onRules}>
+          Rules
+        </button>
       </nav>
     </main>
   );
 };
 
-export default MainMenu;
+/**
+ * Router-aware wrapper — the default export used by React.lazy() in App.tsx.
+ * Wires onPlay/onRules to useNavigate so the pure component stays testable
+ * without a BrowserRouter.
+ */
+const MainMenuRoute = (): JSX.Element => {
+  const navigate = useNavigate();
+  return (
+    <MainMenu
+      onPlay={() => navigate('/game')}
+      onRules={() => navigate('/rules')}
+    />
+  );
+};
+
+export default MainMenuRoute;

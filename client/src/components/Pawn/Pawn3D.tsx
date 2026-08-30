@@ -2,10 +2,12 @@ import { useRef, useState, useCallback } from 'react';
 import { type Mesh, Color } from 'three';
 import { type ThreeEvent } from '@react-three/fiber';
 import { useGameStore } from '../../store/gameStore';
+import { GamePhase } from '../../store/types';
 import { webSocketManager } from '../../websocket/WebSocketManager';
 
 export interface Pawn3DProps {
-  pawnId: number;
+  /** String pawn identifier matching PawnState.id, e.g. "R1"–"R4". */
+  pawnId: string;
   position: [number, number, number];
   /** CSS/hex color string for the pawn body — one per player. */
   color: string;
@@ -39,17 +41,16 @@ export const Pawn3D = ({ pawnId, position, color }: Pawn3DProps): JSX.Element =>
   const setGamePhase = useGameStore((state) => state.setGamePhase);
 
   /** True only when this specific pawn is in the current legal move list. */
-  const isSelectable = legalMoveIds.includes(pawnId) && gamePhase === 'SELECTING';
+  const isSelectable =
+    legalMoveIds.includes(pawnId) && gamePhase === GamePhase.SELECTING;
 
   const handlePointerDown = useCallback(
     (event: ThreeEvent<PointerEvent>) => {
       if (!isSelectable) return;
-      // Prevent the board / scene from also receiving this click.
       event.stopPropagation();
       webSocketManager.send({ type: 'select_pawn', pawn_id: pawnId });
-      // Clear highlights immediately so the UI responds before the server reply.
       clearSelection();
-      setGamePhase('MOVING');
+      setGamePhase(GamePhase.MOVING);
     },
     [isSelectable, pawnId, clearSelection, setGamePhase],
   );
@@ -84,7 +85,6 @@ export const Pawn3D = ({ pawnId, position, color }: Pawn3DProps): JSX.Element =>
       onPointerOver={handlePointerOver}
       onPointerOut={handlePointerOut}
     >
-      {/* Slightly wider base for stability, 16-sided cylinder for roundness */}
       <cylinderGeometry args={[0.3, 0.35, 0.6, 16]} />
       <meshStandardMaterial
         color={color}

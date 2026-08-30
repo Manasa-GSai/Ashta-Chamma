@@ -2,20 +2,21 @@ import { type JSX } from 'react';
 import { useGameStore } from '../../store/gameStore';
 
 export const GameHUD = (): JSX.Element => {
-  const currentPlayer = useGameStore((state) => state.currentPlayer);
-  const rollResult = useGameStore((state) => state.rollResult);
+  const currentPlayerIndex = useGameStore((state) => state.currentPlayerIndex);
+  const currentRoll = useGameStore((state) => state.currentRoll);
   const players = useGameStore((state) => state.players);
 
-  const playerName = players[currentPlayer] ?? `Player ${currentPlayer + 1}`;
+  const playerName =
+    players[currentPlayerIndex]?.name ?? `Player ${currentPlayerIndex + 1}`;
 
   return (
     <div className="game-hud">
       <div data-testid="current-player" className="hud-current-player">
         Current Player: {playerName}
       </div>
-      {rollResult !== null && (
+      {currentRoll !== null && (
         <div data-testid="roll-result" className="hud-roll-result">
-          Roll Result: {rollResult}
+          Roll Result: {currentRoll}
         </div>
       )}
     </div>

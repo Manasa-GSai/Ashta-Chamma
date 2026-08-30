@@ -1,17 +1,19 @@
 import { type JSX } from 'react';
 import { useAuth } from '@clerk/clerk-react';
-import { Navigate } from 'react-router-dom';
-
-interface ProtectedRouteProps {
-  children: JSX.Element;
-}
+import { Navigate, Outlet } from 'react-router-dom';
 
 /**
- * Wraps a route that requires authentication.
- * Redirects unauthenticated users to /login and shows a loading
- * indicator while Clerk determines auth status.
+ * React Router v6 layout route that enforces authentication.
+ * Usage: wrap protected <Route> definitions as children of this element.
+ *
+ * <Route element={<ProtectedRoute />}>
+ *   <Route path="/dashboard" element={<Dashboard />} />
+ * </Route>
+ *
+ * Unauthenticated users are redirected to /sign-in.
+ * While Clerk is resolving auth status an accessible loading indicator renders.
  */
-export const ProtectedRoute = ({ children }: ProtectedRouteProps): JSX.Element => {
+export const ProtectedRoute = (): JSX.Element => {
   const { isSignedIn, isLoaded } = useAuth();
 
   if (!isLoaded) {
@@ -19,8 +21,8 @@ export const ProtectedRoute = ({ children }: ProtectedRouteProps): JSX.Element =
   }
 
   if (!isSignedIn) {
-    return <Navigate to="/login" replace />;
+    return <Navigate to="/sign-in" replace />;
   }
 
-  return children;
+  return <Outlet />;
 };

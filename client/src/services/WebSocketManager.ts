@@ -288,7 +288,10 @@ class WebSocketManager {
 
       case 'game_state_update':
       case 'state_update':
-        store.updateGameState(payload as GameState);
+        // Double-cast required: the wire payload is untyped Record<string, unknown>
+        // but updateGameState accepts Partial<GameState>. The server is trusted to
+        // send the correct shape; runtime validation would be added per WO-xxx.
+        store.updateGameState(payload as unknown as Partial<GameState>);
         break;
 
       case 'error':

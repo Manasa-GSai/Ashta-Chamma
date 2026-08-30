@@ -12,7 +12,6 @@
  * - sendMessage callback is invoked with trimmed text
  */
 
-import React from 'react';
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { render, screen, fireEvent } from '@testing-library/react';
 import { act } from 'react';
@@ -24,8 +23,10 @@ import { useGameStore, MAX_CHAT_MESSAGES, ChatMessage } from '../../store/gameSt
 // Helpers
 // ---------------------------------------------------------------------------
 
+let _msgCounter = 0;
 function makeMessage(overrides: Partial<ChatMessage> = {}): ChatMessage {
   return {
+    id: `msg-${++_msgCounter}`,
     timestamp: new Date().toISOString(),
     senderName: 'Alice',
     senderColor: '#e74c3c',

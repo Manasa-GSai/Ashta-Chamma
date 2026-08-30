@@ -1,5 +1,6 @@
 import { memo } from 'react';
 import { useGameStore } from '../../store/gameStore';
+import { gridToWorld } from '../../utils/gridToWorld';
 import { Pawn3D } from './Pawn3D';
 
 /**
@@ -10,9 +11,6 @@ import { Pawn3D } from './Pawn3D';
  *  - Renders one Pawn3D per pawn (16 total: 4 colors × 4 pawns)
  *  - Provides a stable key for each pawn so React can track identity through moves
  *
- * This component intentionally contains no animation logic — animation is
- * encapsulated in each Pawn3D via the usePawnAnimation hook.
- *
  * Placement: render this component inside an R3F <Canvas> after all lighting
  * is set up, e.g. alongside Board3D.
  */
@@ -21,9 +19,18 @@ export const PawnManager = memo(() => {
 
   return (
     <group name="pawn-manager">
-      {pawns.map((pawn) => (
-        <Pawn3D key={pawn.id} pawn={pawn} />
-      ))}
+      {pawns.map((pawn) => {
+        const worldPos = gridToWorld(pawn.gridPosition.row, pawn.gridPosition.col);
+        return (
+          <Pawn3D
+            key={pawn.id}
+            pawnId={pawn.id}
+            position={[worldPos.x, worldPos.y, worldPos.z]}
+            // PlayerColor values ('RED', 'GREEN', etc.) are valid lowercase CSS colors.
+            color={pawn.color.toLowerCase()}
+          />
+        );
+      })}
     </group>
   );
 });
