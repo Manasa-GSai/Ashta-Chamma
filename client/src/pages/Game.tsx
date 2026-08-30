@@ -59,21 +59,29 @@ const GameCanvas = (): JSX.Element => {
   // components (defined in their own files to stay under the 500-line limit).
   return (
     <div
-      style={{ width: '100vw', height: '100vh', background: '#1a1a2e' }}
+      style={{
+        width: '100vw',
+        height: '100vh',
+        background: '#1a1a2e',
+        display: 'flex',
+        flexDirection: 'column',
+        alignItems: 'center',
+        justifyContent: 'center',
+        fontFamily: 'system-ui, sans-serif',
+        color: '#fff',
+        gap: '1rem',
+      }}
       aria-label="3D game board"
     >
-      {/* Canvas and 3D scene components are rendered here.
-          React Three Fiber <Canvas> and board/pawn components belong in
-          separate files and are imported here once full 3D assets are ready. */}
-      <p
-        style={{
-          color: '#fff',
-          textAlign: 'center',
-          paddingTop: '40vh',
-          fontFamily: 'system-ui, sans-serif',
-        }}
-      >
-        Loading 3D game board…
+      {/* 3D board placeholder — React Three Fiber <Canvas>, BoardRenderer,
+          PawnManager and CowriePhysics will be wired in here once the scene
+          assets are ready. */}
+      <p style={{ fontSize: '1.5rem', margin: 0 }}>Ashta Chamma 3D</p>
+      <p style={{ fontSize: '1rem', opacity: 0.7, margin: 0 }}>
+        Physics engine ready. 3D board coming soon.
+      </p>
+      <p style={{ fontSize: '0.85rem', opacity: 0.5, margin: 0 }}>
+        Multiplayer, cowrie-shell rolls, and board rendering are in development.
       </p>
     </div>
   );
