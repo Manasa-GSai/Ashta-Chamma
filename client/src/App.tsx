@@ -17,7 +17,8 @@ import { BrowserRouter, Route, Routes } from 'react-router-dom';
  * an intermediate partially-rendered state.
  */
 const MainMenu = lazy(() => import('./pages/MainMenu'));
-const Game = lazy(() => import('./pages/Game'));
+const Game = lazy(() => import('./components/GamePage').then((m) => ({ default: m.GamePage })));
+const Rules = lazy(() => import('./pages/Rules').then((m) => ({ default: m.Rules })));
 
 /**
  * Full-viewport loading indicator used as the Suspense fallback.
@@ -60,6 +61,7 @@ export const App = (): JSX.Element => {
         <Routes>
           <Route path="/" element={<MainMenu />} />
           <Route path="/game" element={<Game />} />
+          <Route path="/rules" element={<Rules />} />
         </Routes>
       </Suspense>
     </BrowserRouter>
