@@ -6,3 +6,8 @@ namespace: ashta-chamma
 resources:
   - deployment.yaml
   - service.yaml
+
+images:
+  - name: ashta-chamma
+    newName: 792373136340.dkr.ecr.us-west-2.amazonaws.com/ashta-chamma
+    newTag: latest
