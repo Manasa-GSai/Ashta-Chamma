@@ -2,7 +2,6 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: ashta-chamma
-  namespace: ashta-chamma
   labels:
     app: ashta-chamma
     version: "1.0"
