@@ -1,0 +1,48 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ashta-chamma
+  namespace: ashta-chamma
+  labels:
+    app: ashta-chamma
+    version: "1.0"
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: ashta-chamma
+  template:
+    metadata:
+      labels:
+        app: ashta-chamma
+    spec:
+      containers:
+        - name: ashta-chamma
+          # Image is updated by Opsera/ArgoCD during pipeline runs
+          image: ashta-chamma:latest
+          ports:
+            - containerPort: 8000
+              protocol: TCP
+          env:
+            - name: PYTHONUNBUFFERED
+              value: "1"
+          livenessProbe:
+            httpGet:
+              path: /api/health
+              port: 8000
+            initialDelaySeconds: 15
+            periodSeconds: 20
+          readinessProbe:
+            httpGet:
+              path: /api/health
+              port: 8000
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+            limits:
+              cpu: "500m"
+              memory: "512Mi"
+      restartPolicy: Always
