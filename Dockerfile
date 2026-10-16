@@ -1,5 +1,20 @@
 # ---------------------------------------------------------------------------
-# Stage 1 — dependency installation
+# Stage 1 — build React frontend
+# ---------------------------------------------------------------------------
+FROM node:20-slim AS frontend
+
+WORKDIR /client
+
+# Install dependencies first (layer-cache friendly)
+COPY client/package.json client/package-lock.json ./
+RUN npm ci
+
+# Copy source and build
+COPY client/ ./
+RUN npm run build
+
+# ---------------------------------------------------------------------------
+# Stage 2 — Python dependency installation
 # ---------------------------------------------------------------------------
 FROM python:3.12-slim AS deps
 
@@ -16,7 +31,7 @@ RUN poetry config virtualenvs.in-project true \
     && poetry install --only main --no-root --no-interaction --no-ansi
 
 # ---------------------------------------------------------------------------
-# Stage 2 — runtime image
+# Stage 3 — runtime image
 # ---------------------------------------------------------------------------
 FROM python:3.12-slim AS runtime
 
@@ -27,6 +42,9 @@ COPY --from=deps /app/.venv /app/.venv
 
 # Copy application source
 COPY server/ ./
+
+# Copy the built React frontend into /app/static so FastAPI can serve it
+COPY --from=frontend /client/dist /app/static
 
 # Ensure the venv binaries are on PATH
 ENV PATH="/app/.venv/bin:$PATH" \
