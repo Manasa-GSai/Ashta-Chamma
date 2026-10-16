@@ -8,4 +8,4 @@ resources:
 images:
   - name: ashta-chamma
     newName: 792373136340.dkr.ecr.us-west-2.amazonaws.com/ashta-chamma
-    newTag: 592e93a0ec756dad2776144ede2b74dfe1959ca5
+    newTag: 61bae2b2a2c6d33584f65194c18508c678e256b6
