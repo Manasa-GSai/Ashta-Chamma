@@ -8,9 +8,9 @@ All routers are registered in this module so that the import graph is
 clear and integration tests can import ``app`` directly.
 """
 
-from fastapi import FastAPI
+import logging
 
-from app.routes.users import router as users_router
+from fastapi import FastAPI
 
 app = FastAPI(
     title="Ashta Chamma 3D API",
@@ -21,7 +21,13 @@ app = FastAPI(
     openapi_url="/api/openapi.json",
 )
 
-app.include_router(users_router)
+# Guard against import errors in route modules crashing the whole process.
+# The health endpoint must always be reachable for readiness/liveness probes.
+try:
+    from app.routes.users import router as users_router
+    app.include_router(users_router)
+except Exception:  # noqa: BLE001
+    logging.exception("Failed to load users router — running without it")
 
 
 @app.get("/api/health", tags=["health"])
