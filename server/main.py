@@ -26,8 +26,16 @@ app = FastAPI(
 try:
     from app.routes.users import router as users_router
     app.include_router(users_router)
-except Exception:  # noqa: BLE001
-    logging.exception("Failed to load users router — running without it")
+except Exception as _router_exc:  # noqa: BLE001
+    import traceback as _tb
+    _err = _tb.format_exc()
+    logging.error("Failed to load users router: %s\n%s", _router_exc, _err)
+    # Expose the error at a dedicated endpoint so it is visible without kubectl.
+    from fastapi import Response as _Response
+
+    @app.get("/api/_startup-error", include_in_schema=False)
+    async def _startup_error() -> _Response:
+        return _Response(content=_err, media_type="text/plain")
 
 
 @app.get("/api/health", tags=["health"])
