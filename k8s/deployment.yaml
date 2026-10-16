@@ -14,11 +14,15 @@ spec:
     metadata:
       labels:
         app: ashta-chamma
+      annotations:
+        # Updated each commit so ArgoCD always triggers a rolling restart
+        deploy-sha: "2c4fea7"
     spec:
       containers:
         - name: ashta-chamma
           # Image is updated by Opsera/ArgoCD during pipeline runs
           image: ashta-chamma:latest
+          imagePullPolicy: Always
           ports:
             - containerPort: 8000
               protocol: TCP
