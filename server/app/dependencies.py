@@ -60,3 +60,8 @@ async def get_current_user_id(
             detail="Invalid or missing authentication credentials",
             headers={"WWW-Authenticate": "Bearer"},
         ) from exc
+
+
+# Alias: some route modules import `get_current_clerk_id` (Clerk-specific name).
+# Both names resolve to the same dependency — no behaviour change.
+get_current_clerk_id = get_current_user_id
