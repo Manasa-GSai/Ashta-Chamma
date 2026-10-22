@@ -240,7 +240,10 @@ def test_validate_paths_raises_if_not_ending_at_center(monkeypatch: pytest.Monke
     """A path that does not end at CENTER should raise ValueError."""
     patched = {color: list(path) for color, path in PATHS.items()}
     yellow_path = list(PATHS[PlayerColor.YELLOW])
-    yellow_path[-1] = (3, 3)  # wrong terminal square
+    # Use (0, 0) — a valid in-bounds coordinate that is NOT already in the
+    # YELLOW path (which occupies mostly the inner spiral).  This avoids
+    # triggering the duplicate-coordinate check before the center check.
+    yellow_path[-1] = (0, 0)
     patched[PlayerColor.YELLOW] = yellow_path
     monkeypatch.setattr("app.game.board.PATHS", patched)
     with pytest.raises(ValueError, match="CENTER"):
